@@ -1,0 +1,5 @@
+# Kept deliberately small. The Razorpay client is stdlib urllib, so rate
+# limiting, backoff and latency measurement are visible in src/execute.py
+# rather than hidden inside a library.
+PyYAML>=6.0
+python-dotenv>=1.0.0

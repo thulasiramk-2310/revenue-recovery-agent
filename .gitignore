@@ -1,0 +1,37 @@
+# Secrets — NEVER commit. This repo is public.
+.env
+.env.*
+!.env.example
+*.key
+rzp-test-key.csv
+*credentials*.csv
+*.csv
+*.xlsx
+*.xls
+
+# Generated artifacts
+results/
+data/*.json
+data/*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Agent / assistant working files -- local only, not part of the deliverable
+.claude/
+.claudeignore
+CLAUDE.md
+.code-review-graph/
+.cursor/
+.aider*
+.github/copilot-instructions.md
+AGENTS.md

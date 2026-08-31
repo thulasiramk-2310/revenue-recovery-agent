@@ -1,0 +1,217 @@
+# ---------------------------------------------------------------------------
+# Payment Recovery Policy
+#
+# This file is the ONLY place recovery behaviour is decided. src/policy.py is a
+# pure interpreter of this document: it must not contain hardcoded failure
+# codes, delays, or thresholds. Every decision the agent emits cites the rule
+# path here that produced it (the `policy_rule_applied` field in the audit
+# log), so a reviewer can diff this file against the trail and reproduce any
+# single call the agent made.
+#
+# Money is always in paise. Times are IST (Asia/Kolkata) unless named _utc.
+# ---------------------------------------------------------------------------
+
+version: 1
+policy_id: recovery-policy-v1
+
+# --- Global bounds -------------------------------------------------------
+# Hard ceilings. No code path may exceed these, whatever a per-code rule says.
+limits:
+  max_attempts: 4                 # total attempts per txn, INCLUDING the
+                                  # original failure that got us here
+  cooldown_hours: 6               # DEFAULT min gap between two attempts on one
+                                  # txn. A retry_window may shorten this for
+                                  # itself via cooldown_override_minutes, but
+                                  # only with a stated reason -- see
+                                  # NETWORK_TIMEOUT. Nothing may loosen
+                                  # max_attempts, which stays absolute.
+  max_attempts_per_customer_per_day: 5
+  max_customer_contacts_per_transaction: 2
+  batch_spend_ceiling_paise: 0    # 0 = agent may not incur cost. Raise
+                                  # deliberately, never by default.
+  abort_batch_if_decline_rate_above: 0.85
+                                  # circuit breaker: if live retries are
+                                  # declining above this rate, halt the batch.
+                                  # We are probably making things worse, e.g.
+                                  # an issuer outage we failed to detect.
+
+# --- Terminal failures ---------------------------------------------------
+# Never retried. Hard declines: a retry is pure cost, irritates the issuer,
+# and on some networks counts against the merchant's decline ratio. The only
+# legitimate move is asking the customer for new instrument details.
+stop_immediately_on:
+  - ACCOUNT_CLOSED
+  - CARD_BLOCKED
+  - CARD_EXPIRED
+  - INVALID_CVV
+
+# --- Retry windows, keyed by failure code --------------------------------
+# delays_minutes = offset from the ORIGINAL failure for each later attempt.
+# Its length caps retries for that code; limits.max_attempts still wins if
+# it is lower.
+#
+# strategy:
+#   immediate_backoff - transient fault, retry fast with widening spacing
+#   scheduled         - retry at a time chosen for balance-availability reasons
+#   await_signal      - blocked until an external condition clears, then retry
+#   none              - never retry (terminal)
+retry_windows:
+
+  NETWORK_TIMEOUT:
+    strategy: immediate_backoff
+    delays_minutes: [2, 15, 90]
+    require_reconcile_before_retry: true
+    cooldown_override_minutes: 2
+    cooldown_override_rationale: >
+      The 6h default exists to stop us hammering a customer's instrument with
+      repeated dunning attempts. This is not that: the authorisation outcome
+      is genuinely unknown, and the correct move is to reconcile and settle
+      the ambiguity quickly. Waiting 6h to find out whether we already
+      charged someone is worse for the customer, not better. Guarded by
+      require_reconcile_before_retry, so no blind re-attempt happens here.
+    rationale: >
+      A timeout is ambiguous: the authorisation may have actually succeeded at
+      the issuer. Reconcile payment status before every retry or we risk
+      double-charging the customer.
+
+  ISSUER_DOWN:
+    strategy: await_signal
+    resume_when: issuer_health_recovered
+    max_wait_hours: 12
+    delays_minutes: [30]          # applied AFTER the health signal clears
+    require_reconcile_before_retry: true
+    cooldown_override_minutes: 30
+    cooldown_override_rationale: >
+      The gap here is set by the issuer's recovery, not by a fixed clock: the
+      transaction is held for the whole outage window and only then waits 30
+      minutes. Leaving the 6h default on top would add delay on the far side
+      of a wait that is already long, for no protective benefit.
+    rationale: >
+      Retrying into a degraded issuer burns attempts against max_attempts for
+      a reason that has nothing to do with this customer. Hold, then spend a
+      single attempt once the bank recovers.
+
+  INSUFFICIENT_FUNDS:
+    strategy: scheduled
+    delays_minutes: [1440, 4320]  # +1 day, +3 days
+    align_to: salary_credit_window
+    rationale: >
+      Balance-driven, not instrument-driven. Indian retail balances reload on
+      salary credit, typically the 1st-7th. Retrying an hour later mostly
+      re-hits an empty account; aligning to the reload window is where the
+      recoverable money actually is.
+
+  DO_NOT_HONOR:
+    strategy: scheduled
+    delays_minutes: [720, 2880]   # +12h, +2 days
+    max_attempts_override: 3
+    rationale: >
+      Generic issuer refusal hiding several causes. Soft velocity and risk
+      blocks do clear; many others never will. Retry sparingly, escalate early.
+
+  CARD_EXPIRED:
+    strategy: none
+    rationale: Terminal. Needs a new instrument from the customer.
+  CARD_BLOCKED:
+    strategy: none
+    rationale: Terminal. Issuer-side block; customer must contact their bank.
+  ACCOUNT_CLOSED:
+    strategy: none
+    rationale: Terminal. The account no longer exists.
+  INVALID_CVV:
+    strategy: none
+    rationale: Terminal for stored credentials. Needs re-entry by the customer.
+
+  UNKNOWN:
+    strategy: scheduled
+    delays_minutes: [360]         # >= limits.cooldown_hours, deliberately
+    max_attempts_override: 2
+    rationale: >
+      Unmapped code. One conservative retry, then human review. The delay is
+      set at the default cooldown rather than given an override: for a
+      failure we do not understand, the cautious default should win. Loosening
+      a limit requires a specific reason, and "we don't know what this is" is
+      the opposite of one.
+
+# Which retry_windows entry catches a failure code we have never seen. Named
+# here rather than in code so that policy.py needs no literal failure code of
+# its own -- see the architectural rule at the top of this file.
+unmapped_code_fallback: UNKNOWN
+
+# --- Salary-credit alignment ---------------------------------------------
+# Used by retry_windows[*].align_to. A scheduled retry is nudged into the next
+# such window when one falls within lookahead_hours.
+salary_credit_window:
+  days_of_month: [1, 2, 3, 4, 5, 6, 7]
+  preferred_hour_ist: 11
+  lookahead_hours: 96
+
+# --- Escalation ladder ---------------------------------------------------
+# Ordered. The agent climbs one rung at a time and never skips. A rung whose
+# `requires` predicates are unmet is passed over, not jumped.
+escalation_ladder:
+
+  - step: 1
+    action: silent_retry
+    description: Re-attempt authorisation. No customer contact.
+    requires: [retryable_failure, attempts_remaining, cooldown_elapsed]
+    customer_visible: false
+
+  - step: 2
+    action: retry_with_updated_instrument
+    description: >
+      Re-attempt using a newer saved instrument for the same customer, where
+      the network account-updater has supplied one.
+    requires: [alternate_instrument_available, attempts_remaining]
+    customer_visible: false
+
+  - step: 3
+    action: notify_customer
+    description: One transactional message stating the payment failed, with a fix link.
+    requires: [contact_quota_remaining, within_contact_hours, consent_on_file]
+    customer_visible: true
+    channel_preference: [email, sms]
+
+  - step: 4
+    action: request_instrument_update
+    description: Secure link to replace the expired or blocked instrument.
+    requires: [contact_quota_remaining, within_contact_hours, consent_on_file]
+    customer_visible: true
+
+  - step: 5
+    action: hand_off_to_human
+    description: Queue for merchant ops review. The agent takes no further action.
+    requires: []
+    customer_visible: false
+    terminal: true
+
+# --- Compliance rails ----------------------------------------------------
+# Not optimisations. A run that violates one of these is a FAILED run even if
+# it recovered more money.
+compliance:
+  contact_hours_ist:
+    start: "09:00"
+    end: "21:00"
+  quiet_days: []                  # national holidays, if supplied
+  require_consent_for_contact: true
+  transactional_only: true        # never mix marketing into a recovery message
+  subscription_rules:             # RBI e-mandate norms for recurring debits
+    require_pre_debit_notification: true
+    pre_debit_notification_hours: 24
+    max_retries_per_mandate_cycle: 2
+    rationale: >
+      Recurring debits carry a pre-debit notification duty and tighter retry
+      norms than one-off card payments, so subscriptions are capped separately
+      and more strictly than limits.max_attempts.
+  never_do:
+    - store_raw_card_details
+    - retry_after_customer_opt_out
+    - contact_outside_contact_hours
+    - exceed_max_attempts
+
+# --- Audit ---------------------------------------------------------------
+audit:
+  log_path: results/run.log
+  hash_chain: true                # each entry commits to the previous one
+  log_skipped_decisions: true     # "we chose NOT to retry" is a decision too
+                                  # and must appear in the trail
