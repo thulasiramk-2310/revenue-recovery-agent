@@ -58,8 +58,11 @@ def decision(action="silent_retry", **kw):
 
 class TestSafetyRails(unittest.TestCase):
 
+    # The key fixtures below are obvious placeholders on purpose. A
+    # realistic-looking rzp_live_ string in a public repo trips GitHub secret
+    # scanning and forces a reviewer to stop and check whether it is real.
     def test_a_live_key_is_a_hard_abort(self):
-        os.environ["RAZORPAY_KEY_ID"] = "rzp_live_ABCDEFGHIJKL"
+        os.environ["RAZORPAY_KEY_ID"] = "rzp_live_xxxxPLACEHOLDERxxxx"
         os.environ["RAZORPAY_KEY_SECRET"] = "whatever"
         try:
             with self.assertRaises(LiveKeyRefused):
@@ -95,9 +98,9 @@ class TestSafetyRails(unittest.TestCase):
             ex._log("test_event", note="leaking " + ex._secret)
 
     def test_masking_keeps_enough_to_identify_and_not_enough_to_use(self):
-        m = mask("rzp_test_ABCDEFGHIJKL")
+        m = mask("rzp_test_xxxxPLACEHOLDERxxxx")
         self.assertIn("rzp_test_", m)
-        self.assertNotIn("ABCDEFGHIJKL", m)
+        self.assertNotIn("PLACEHOLDER", m)
         self.assertEqual(mask(""), "<unset>")
 
 
