@@ -17,8 +17,14 @@ policy_id: recovery-policy-v1
 # --- Global bounds -------------------------------------------------------
 # Hard ceilings. No code path may exceed these, whatever a per-code rule says.
 limits:
-  max_attempts: 4                 # total attempts per txn, INCLUDING the
-                                  # original failure that got us here
+  # TWO SEPARATE BUDGETS. Exhausting one must never silently spend or
+  # cancel the other. Gateway attempts cost money and issuer goodwill;
+  # customer contacts cost attention and trust. A customer whose card has
+  # expired needs a message precisely BECAUSE retrying is pointless, so
+  # running out of attempts is not a reason to stop talking to them.
+  max_attempts: 4                 # GATEWAY attempts per txn, INCLUDING the
+                                  # original failure that got us here. Bounds
+                                  # rungs marked `consumes: attempt` only.
   cooldown_hours: 6               # DEFAULT min gap between two attempts on one
                                   # txn. A retry_window may shorten this for
                                   # itself via cooldown_override_minutes, but
@@ -27,6 +33,14 @@ limits:
                                   # max_attempts, which stays absolute.
   max_attempts_per_customer_per_day: 5
   max_customer_contacts_per_transaction: 2
+                                  # CONTACT budget. Bounds rungs marked
+                                  # `consumes: contact` only, and is checked
+                                  # independently of max_attempts.
+  min_hours_between_contacts: 24  # Two dunning messages in the same minute is
+                                  # harassment even when both are permitted by
+                                  # quota. Spacing is a compliance property of
+                                  # the contact budget, not of the retry
+                                  # cooldown, which protects the instrument.
   batch_spend_ceiling_paise: 0    # 0 = agent may not incur cost. Raise
                                   # deliberately, never by default.
   abort_batch_if_decline_rate_above: 0.85
@@ -36,9 +50,15 @@ limits:
                                   # an issuer outage we failed to detect.
 
 # --- Terminal failures ---------------------------------------------------
-# Never retried. Hard declines: a retry is pure cost, irritates the issuer,
-# and on some networks counts against the merchant's decline ratio. The only
-# legitimate move is asking the customer for new instrument details.
+# Never RETRIED. Hard declines: a retry is pure cost, irritates the issuer,
+# and on some networks counts against the merchant's decline ratio.
+#
+# This list forecloses the gateway, not the customer. "The only legitimate
+# move is asking the customer for new instrument details" is a description of
+# what the agent SHOULD still do here, so a code in this list disables rungs
+# marked `consumes: attempt` and then continues down the ladder to the contact
+# rungs. Treating a hard decline as the end of the transaction was a bug: it
+# abandoned exactly the customers most able to fix the problem themselves.
 stop_immediately_on:
   - ACCOUNT_CLOSED
   - CARD_BLOCKED
@@ -149,12 +169,26 @@ salary_credit_window:
 # --- Escalation ladder ---------------------------------------------------
 # Ordered. The agent climbs one rung at a time and never skips. A rung whose
 # `requires` predicates are unmet is passed over, not jumped.
+#
+# `consumes` names which budget the rung spends, and is the ONLY thing that
+# decides which limit bounds it:
+#   attempt - limits.max_attempts, limits.cooldown_hours
+#   contact - limits.max_customer_contacts_per_transaction,
+#             limits.min_hours_between_contacts, compliance.contact_hours_ist
+#   none    - spends neither, so it stays reachable after both are exhausted
+#
+# Running out of one budget disables only the rungs that spend it. The ladder
+# then keeps descending. This is why a hard decline, which can never spend an
+# attempt, still reaches step 3.
 escalation_ladder:
 
   - step: 1
     action: silent_retry
     description: Re-attempt authorisation. No customer contact.
-    requires: [retryable_failure, attempts_remaining, cooldown_elapsed]
+    requires: [retry_permitted, retryable_failure, attempts_remaining, cooldown_elapsed]
+    consumes: attempt
+    repeatable: true                # each firing is a distinct retry, bounded
+                                    # by attempts_remaining
     customer_visible: false
 
   - step: 2
@@ -162,26 +196,42 @@ escalation_ladder:
     description: >
       Re-attempt using a newer saved instrument for the same customer, where
       the network account-updater has supplied one.
-    requires: [alternate_instrument_available, attempts_remaining]
+    requires: [retry_permitted, alternate_instrument_available, attempts_remaining]
+    consumes: attempt
+    repeatable: true
     customer_visible: false
 
   - step: 3
     action: notify_customer
     description: One transactional message stating the payment failed, with a fix link.
-    requires: [contact_quota_remaining, within_contact_hours, consent_on_file]
+    requires:
+      [contact_quota_remaining, contact_spacing_elapsed, within_contact_hours,
+       consent_on_file]
+    consumes: contact
+    repeatable: false               # sending this template twice is a
+                                    # duplicate, not an escalation. Without
+                                    # this, step 3 spends the whole contact
+                                    # budget on two identical notices and
+                                    # step 4 -- the message that actually asks
+                                    # for a new instrument -- never sends.
     customer_visible: true
     channel_preference: [email, sms]
 
   - step: 4
     action: request_instrument_update
     description: Secure link to replace the expired or blocked instrument.
-    requires: [contact_quota_remaining, within_contact_hours, consent_on_file]
+    requires:
+      [contact_quota_remaining, contact_spacing_elapsed, within_contact_hours,
+       consent_on_file]
+    consumes: contact
+    repeatable: false
     customer_visible: true
 
   - step: 5
     action: hand_off_to_human
     description: Queue for merchant ops review. The agent takes no further action.
     requires: []
+    consumes: none
     customer_visible: false
     terminal: true
 

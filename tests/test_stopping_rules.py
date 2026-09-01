@@ -86,37 +86,59 @@ class PolicyCase(unittest.TestCase):
 # -- terminal failure codes ----------------------------------------------
 
 class TestTerminalCodes(PolicyCase):
+    """A hard decline forecloses the GATEWAY, not the transaction.
 
-    def test_every_terminal_code_stops(self):
+    These tests previously asserted `action == STOP`. That was a proxy: while
+    a terminal code ended the transaction outright, "stopped" and "was not
+    retried" were the same observation. They are no longer the same, because a
+    hard decline now escalates to the customer -- which is the one move that
+    can actually fix an expired card.
+
+    So each test here asserts the rule that has to hold, which is that no
+    attempt is spent, and asserts it through `consumes` and
+    `retry_foreclosed_by` rather than through the shape of the outcome. That
+    is strictly stronger: it survives any future change to the ladder, and it
+    would still fail if a terminal code were quietly re-authorised.
+    """
+
+    def test_every_terminal_code_forecloses_retries(self):
         for code in self.policy.stop_immediately_on:
             with self.subTest(code=code):
                 d = self.decide(txn(failure_code=code))
-                self.assertEqual(d.action, STOP, code + " must stop")
-                self.assertIsNone(d.scheduled_time, code + " must not be scheduled")
-                self.assertTrue(d.terminal)
+                self.assertNotEqual(d.consumes, "attempt",
+                                    code + " must never spend an attempt")
+                self.assertEqual(d.retry_foreclosed_by,
+                                 "stop_immediately_on[%s]" % code)
 
-    def test_terminal_code_cites_the_rule_that_stopped_it(self):
+    def test_terminal_code_cites_the_rule_that_foreclosed_it(self):
+        # The trail must name the rule even though the decision that comes
+        # back is now an escalation. A reviewer greps retry_foreclosed_by;
+        # without it the refusal would only be visible as an absence.
         for code in self.policy.stop_immediately_on:
             with self.subTest(code=code):
                 d = self.decide(txn(failure_code=code))
-                self.assertEqual(d.policy_rule_applied, "stop_immediately_on[%s]" % code)
+                self.assertEqual(d.retry_foreclosed_by,
+                                 "stop_immediately_on[%s]" % code)
 
-    def test_terminal_code_stops_on_first_attempt_with_everything_favourable(self):
-        # Attempt 1, cooldown long elapsed, consent on file, healthy issuer.
-        # Nothing about the context should rescue a hard decline.
+    def test_terminal_code_is_not_retried_with_everything_favourable(self):
+        # Attempt 1, cooldown long elapsed, consent on file, healthy issuer,
+        # an alternate instrument on hand. Nothing in the context may rescue a
+        # hard decline onto a retry rung -- including rung 2, which would
+        # otherwise be tempted by the alternate instrument.
         d = self.decide(
             txn(failure_code="CARD_EXPIRED", attempt_number=1),
             TransactionState(consent_on_file=True,
                              alternate_instrument_available=True),
         )
-        self.assertEqual(d.action, STOP)
+        self.assertNotEqual(d.consumes, "attempt")
+        self.assertIsNotNone(d.retry_foreclosed_by)
 
-    def test_terminal_code_stops_even_on_a_large_amount(self):
+    def test_terminal_code_is_not_retried_even_on_a_large_amount(self):
         # The forgone-money case. A blocked card that would clear on retry is
         # still not retried; size must not buy an exception.
         d = self.decide(txn(failure_code="CARD_BLOCKED", amount_paise=5_000_000))
-        self.assertEqual(d.action, STOP)
-        self.assertEqual(d.audit_decision, "no_action_terminal")
+        self.assertNotEqual(d.consumes, "attempt")
+        self.assertEqual(d.retry_foreclosed_by, "stop_immediately_on[CARD_BLOCKED]")
 
     def test_issuer_outage_cannot_launder_a_terminal_code(self):
         # A degradation window must not turn CARD_EXPIRED into "transient".
@@ -132,10 +154,59 @@ class TestTerminalCodes(PolicyCase):
         for code in self.policy.stop_immediately_on:
             with self.subTest(code=code):
                 d = self.decide(txn(failure_code=code), signals=signal)
-                self.assertEqual(d.action, STOP)
-                self.assertEqual(
-                    d.policy_rule_applied, "stop_immediately_on[%s]" % code
-                )
+                self.assertNotEqual(d.consumes, "attempt")
+                self.assertEqual(d.retry_foreclosed_by,
+                                 "stop_immediately_on[%s]" % code)
+
+    # -- the behaviour the old design was missing entirely ----------------
+
+    def test_terminal_code_still_reaches_the_customer(self):
+        # The point of the change. An expired card is the case where the
+        # customer is the ONLY party who can resolve the failure, so refusing
+        # to retry must not also mean refusing to tell them.
+        d = self.decide(txn(failure_code="CARD_EXPIRED"))
+        self.assertEqual(d.consumes, "contact")
+        self.assertTrue(d.customer_visible)
+        self.assertIsNotNone(d.channel)
+
+    def test_terminal_code_escalation_is_still_bounded_by_the_contact_quota(self):
+        # Escalating instead of stopping must not become an unbounded licence
+        # to message someone. The contact budget is a real ceiling.
+        quota = int(self.policy.limits["max_customer_contacts_per_transaction"])
+        d = self.decide(
+            txn(failure_code="CARD_EXPIRED"),
+            TransactionState(contacts_used=quota),
+        )
+        self.assertNotEqual(d.consumes, "contact")
+        self.assertFalse(d.customer_visible)
+
+    def test_terminal_code_without_consent_hands_off_rather_than_contacting(self):
+        # Consent gates the contact rungs, so the ladder should fall through
+        # to handoff rather than inventing a contact it is not permitted to
+        # make. Failing closed, not failing silent.
+        d = self.decide(
+            txn(failure_code="ACCOUNT_CLOSED"),
+            TransactionState(consent_on_file=False),
+        )
+        self.assertFalse(d.customer_visible)
+        self.assertNotEqual(d.consumes, "attempt")
+        self.assertTrue(d.terminal)
+
+    def test_a_ladder_that_drops_retry_permitted_is_refused_not_obeyed(self):
+        # The choke point. policy.yaml is editable, so the predicate guarding
+        # the retry rungs is not by itself a guarantee. Simulate the dangerous
+        # edit -- someone removes retry_permitted from rung 1 -- and assert the
+        # code refuses rather than quietly retrying a blocked card.
+        import copy
+        from src.policy import Policy, PolicyViolation
+        doc = copy.deepcopy(self.policy.doc)
+        for rung in doc["escalation_ladder"]:
+            rung["requires"] = [r for r in (rung.get("requires") or [])
+                                if r not in ("retry_permitted", "retryable_failure")]
+        weakened = Policy(doc)
+        t = txn(failure_code="CARD_BLOCKED")
+        with self.assertRaises(PolicyViolation):
+            weakened.decide(t, diagnose(t, []), TransactionState(), [], self.now)
 
 
 # -- opt-out --------------------------------------------------------------
@@ -180,16 +251,41 @@ class TestOptOut(PolicyCase):
 
 class TestAttemptCaps(PolicyCase):
 
-    def test_at_the_cap_stops(self):
+    def test_at_the_cap_spends_no_further_attempt(self):
+        # The cap bounds the ATTEMPT budget, so that is what is asserted. It
+        # no longer ends the transaction: escalation to the customer spends a
+        # different budget and stays available. See TestTerminalCodes for why
+        # the assertion moved off `action == STOP`.
         cap = self.policy.limits["max_attempts"]
         d = self.decide(txn(failure_code="INSUFFICIENT_FUNDS", attempt_number=cap))
-        self.assertEqual(d.action, STOP)
-        self.assertEqual(d.audit_decision, "abandoned")
+        self.assertNotEqual(d.consumes, "attempt")
+        self.assertIsNotNone(d.retry_foreclosed_by)
 
-    def test_above_the_cap_stops(self):
+    def test_above_the_cap_spends_no_further_attempt(self):
         cap = self.policy.limits["max_attempts"]
         d = self.decide(txn(failure_code="INSUFFICIENT_FUNDS", attempt_number=cap + 5))
-        self.assertEqual(d.action, STOP)
+        self.assertNotEqual(d.consumes, "attempt")
+        self.assertIsNotNone(d.retry_foreclosed_by)
+
+    def test_exhausting_attempts_does_not_exhaust_contacts(self):
+        # The whole point of separating the budgets. A customer past the retry
+        # cap is still reachable, and previously was not: this is the case
+        # that made rungs 3-5 dead code and put a false "0 contacts" in the
+        # cost table.
+        cap = self.policy.limits["max_attempts"]
+        d = self.decide(txn(failure_code="INSUFFICIENT_FUNDS", attempt_number=cap))
+        self.assertEqual(d.consumes, "contact")
+        self.assertTrue(d.customer_visible)
+
+    def test_exhausting_contacts_does_not_exhaust_attempts(self):
+        # And the converse, which is the same rule read the other way round.
+        quota = int(self.policy.limits["max_customer_contacts_per_transaction"])
+        d = self.decide(
+            txn(failure_code="INSUFFICIENT_FUNDS", attempt_number=1),
+            TransactionState(contacts_used=quota),
+        )
+        self.assertEqual(d.consumes, "attempt")
+        self.assertIsNone(d.retry_foreclosed_by)
 
     def test_below_the_cap_does_not_stop_for_that_reason(self):
         d = self.decide(txn(failure_code="NETWORK_TIMEOUT", attempt_number=1))
@@ -235,8 +331,8 @@ class TestAttemptCaps(PolicyCase):
                 d = self.decide(probe, signals=signals,
                                 now=later(720))
                 if n >= eff:
-                    self.assertIn(
-                        d.action, (STOP, DEFER, HOLD),
+                    self.assertNotEqual(
+                        d.consumes, "attempt",
                         "%s attempt %d/%d produced %s"
                         % (t["transaction_id"], n, eff, d.action),
                     )
@@ -449,19 +545,25 @@ class TestEnforcementOrder(PolicyCase):
         self.assertIn("opt_out", d.policy_rule_applied)
 
     def test_terminal_code_beats_attempt_cap(self):
+        # Both foreclose retries; only one is the reason, and the trail must
+        # attribute it to the rule that fired first.
         cap = self.policy.limits["max_attempts"]
         d = self.decide(txn(failure_code="CARD_EXPIRED", attempt_number=cap + 2))
-        self.assertTrue(d.policy_rule_applied.startswith("stop_immediately_on"))
+        self.assertTrue(d.retry_foreclosed_by.startswith("stop_immediately_on"))
 
     def test_attempt_cap_beats_cooldown(self):
+        # Rule 3 forecloses before rule 4 can defer. With no attempt left to
+        # protect, the cooldown is not merely outranked, it is skipped -- so
+        # the decision must not be attributed to it.
         cap = self.policy.limits["max_attempts"]
         d = self.decide(
             txn(failure_code="INSUFFICIENT_FUNDS", attempt_number=cap),
             TransactionState(last_attempt_at=BASE_TS),
             now=later(1),
         )
-        self.assertEqual(d.action, STOP)
+        self.assertNotEqual(d.consumes, "attempt")
         self.assertNotEqual(d.policy_rule_applied, "limits.cooldown_hours")
+        self.assertNotIn("cooldown", (d.retry_foreclosed_by or ""))
 
     def test_cooldown_beats_issuer_degradation(self):
         signals = [{
@@ -557,6 +659,73 @@ class TestEscalationLadder(PolicyCase):
                     self.assertGreaterEqual(d.escalation_step, current)
 
 
+# -- escalation reaches the customer --------------------------------------
+
+class TestEscalationActuallyRuns(PolicyCase):
+    """Regression tests for rules that were advertised but never fired.
+
+    Three separate limits in policy.yaml had never once taken effect in a
+    real run: rungs 3-5 of the ladder (unreachable behind a terminal STOP),
+    rung 4 specifically (rung 3 repeated and ate the contact budget), and
+    limits.max_attempts_per_customer_per_day (TransactionState carried the
+    field and no caller ever populated it).
+
+    All three failed the same way -- silently, looking like restraint. A
+    policy document that promises a rule the run does not apply is worse than
+    one that never promised it, so each is pinned here.
+    """
+
+    def test_a_hard_decline_reaches_the_instrument_update_rung(self):
+        # The end-to-end path that matters: expired card, no retry possible,
+        # customer asked for a new instrument. Walk the ladder by hand.
+        seen = []
+        state = TransactionState(consent_on_file=True)
+        now = "2026-08-11T10:00:00+05:30"
+        for _ in range(6):
+            d = self.decide(txn(failure_code="CARD_EXPIRED"), state, now=now)
+            if d.action == DEFER:
+                now = d.scheduled_time
+                continue
+            seen.append(d.action)
+            if d.terminal:
+                break
+            if d.consumes == "contact":
+                state.contacts_used += 1
+                state.last_contact_at = now
+            if d.escalation_step:
+                state.escalation_step = max(state.escalation_step,
+                                            d.escalation_step)
+        self.assertIn("notify_customer", seen)
+        self.assertIn("request_instrument_update", seen)
+        self.assertEqual(seen[-1], "hand_off_to_human")
+
+    def test_rung_three_does_not_repeat_and_starve_rung_four(self):
+        # The bug: with rung 3 repeatable, two identical notices spent the
+        # whole contact budget and the instrument-update request never sent.
+        state = TransactionState(escalation_step=3, contacts_used=1,
+                                 consent_on_file=True,
+                                 last_contact_at="2026-08-10T10:00:00+05:30")
+        d = self.decide(txn(failure_code="CARD_EXPIRED"), state,
+                        now="2026-08-11T11:00:00+05:30")
+        self.assertEqual(d.action, "request_instrument_update")
+        self.assertEqual(d.escalation_step, 4)
+
+    def test_retry_rungs_still_repeat(self):
+        # The converse. Rung 1 must keep repeating while attempts remain --
+        # this is the ladder fix that a naive "never repeat" rule would undo.
+        rung = next(r for r in self.policy.escalation_ladder if r["step"] == 1)
+        self.assertTrue(rung.get("repeatable"),
+                        "rung 1 must repeat or the attempt allowance is unusable")
+        contact = next(r for r in self.policy.escalation_ladder
+                       if r.get("consumes") == "contact")
+        self.assertFalse(contact.get("repeatable"))
+
+    def test_every_ladder_rung_declares_which_budget_it_spends(self):
+        for rung in self.policy.escalation_ladder:
+            self.assertIn(rung.get("consumes"), ("attempt", "contact", "none"),
+                          "rung %s must declare consumes" % rung["step"])
+
+
 # -- compliance -----------------------------------------------------------
 
 class TestComplianceRails(PolicyCase):
@@ -568,7 +737,44 @@ class TestComplianceRails(PolicyCase):
         d = self.decide(txn(failure_code="INSUFFICIENT_FUNDS"), state, now=night)
         if d.customer_visible:
             self.assertEqual(d.action, DEFER)
-            self.assertEqual(d.policy_rule_applied, "compliance.contact_hours_ist")
+            # The contact-hours deferral is no longer a special case in the
+            # ladder; it is one instance of the general "blocked only by a
+            # clock" rule, so policy_rule_applied names the rung and the
+            # predicate that held it. The compliance path is still cited --
+            # asserted here, because a rail that stops appearing in the trail
+            # is indistinguishable from a rail that stopped being enforced.
+            self.assertIn("within_contact_hours", d.policy_rule_applied)
+            self.assertIn("compliance.contact_hours_ist", d.bounded_by)
+
+    def test_two_contacts_on_one_transaction_are_spaced_apart(self):
+        # The contact budget allows a second message; the spacing rule says
+        # not yet. That is a deferral, not a refusal -- and specifically not a
+        # reason to fall through to handoff and strand rung 4.
+        gap = float(self.policy.limits["min_hours_between_contacts"])
+        just_sent = "2026-08-11T10:00:00+05:30"
+        state = TransactionState(escalation_step=3, contacts_used=1,
+                                 last_contact_at=just_sent, consent_on_file=True)
+        d = self.decide(txn(failure_code="CARD_EXPIRED"), state,
+                        now="2026-08-11T11:00:00+05:30")
+        self.assertEqual(d.action, DEFER)
+        self.assertIn("limits.min_hours_between_contacts", d.bounded_by)
+        self.assertGreaterEqual(
+            datetime.fromisoformat(d.scheduled_time),
+            datetime.fromisoformat(just_sent) + timedelta(hours=gap),
+        )
+
+    def test_a_spacing_deferral_still_lands_inside_contact_hours(self):
+        # 24h after a 22:00 send is 22:00, which is outside the window. The
+        # two rules compose: the later of the two clocks wins, then the
+        # contact window is applied on top.
+        state = TransactionState(escalation_step=3, contacts_used=1,
+                                 last_contact_at="2026-08-11T20:30:00+05:30",
+                                 consent_on_file=True)
+        d = self.decide(txn(failure_code="CARD_EXPIRED"), state,
+                        now="2026-08-11T21:30:00+05:30")
+        self.assertEqual(d.action, DEFER)
+        self.assertTrue(self.policy.within_contact_hours(
+            datetime.fromisoformat(d.scheduled_time)))
 
     def test_deferred_contact_is_rescheduled_into_permitted_hours(self):
         night = "2026-08-11T03:00:00+05:30"
@@ -697,8 +903,9 @@ class TestStructuralGuards(unittest.TestCase):
         p = Policy(doc)
         t = txn(failure_code="NETWORK_TIMEOUT")
         d = p.decide(t, diagnose(t), TransactionState(), [], later(48))
-        self.assertEqual(d.action, STOP)
-        self.assertEqual(d.policy_rule_applied, "stop_immediately_on[NETWORK_TIMEOUT]")
+        self.assertNotEqual(d.consumes, "attempt")
+        self.assertEqual(d.retry_foreclosed_by,
+                         "stop_immediately_on[NETWORK_TIMEOUT]")
 
     def test_diagnosis_hard_set_matches_policy_terminal_codes(self):
         # Drift guard. If someone adds a code to stop_immediately_on but not
@@ -798,12 +1005,20 @@ class TestAuditCoverage(unittest.TestCase):
                 for t in terminal:
                     decide_and_log(policy, log, t, diagnose(t),
                                    TransactionState(), [], later(48))
+            # The refusal is what must be in the trail, not any particular
+            # decision verb. A hard decline now logs an escalation, so keying
+            # on "no_action_terminal" would silently pass by matching nothing
+            # -- which is how this test failed when the semantics changed, and
+            # is exactly the failure mode it exists to catch. Key on the
+            # refusal itself.
             entries = [e for e in audit_mod.read_entries(path)
-                       if e.get("decision") == "no_action_terminal"]
+                       if e.get("retry_foreclosed_by")]
             self.assertEqual(len(entries), len(terminal))
             for e in entries:
                 self.assertTrue(e["reason"])
                 self.assertTrue(e["policy_rule_applied"])
+                self.assertTrue(e["retry_foreclosed_by"].startswith(
+                    "stop_immediately_on"))
         finally:
             os.unlink(path)
 
@@ -827,12 +1042,21 @@ class TestBatchInvariants(unittest.TestCase):
         }
 
     def test_no_terminal_code_is_ever_scheduled_for_retry(self):
+        # Asserts the GUARANTEE -- no attempt is spent - rather than the shape
+        # the refusal happens to take. These used to assert action == STOP,
+        # which was a valid proxy only while a hard decline ended the
+        # transaction. It now escalates to the customer instead, so STOP would
+        # test the old design rather than the rule that matters.
         terminal = set(self.policy.stop_immediately_on)
         for t in self.txns:
             d = self.decisions[t["transaction_id"]]
             if t["failure_code"] in terminal:
-                self.assertEqual(d.action, STOP, t["transaction_id"])
-                self.assertIsNone(d.scheduled_time, t["transaction_id"])
+                self.assertNotEqual(d.consumes, "attempt", t["transaction_id"])
+                self.assertEqual(
+                    d.retry_foreclosed_by,
+                    "stop_immediately_on[%s]" % t["failure_code"],
+                    t["transaction_id"],
+                )
 
     def test_no_decision_exceeds_its_attempt_cap(self):
         for t in self.txns:
@@ -841,7 +1065,8 @@ class TestBatchInvariants(unittest.TestCase):
                 t["failure_code"], t["is_subscription"]
             )
             if t["attempt_number"] >= eff:
-                self.assertIn(d.action, (STOP, DEFER, HOLD), t["transaction_id"])
+                self.assertNotEqual(d.consumes, "attempt", t["transaction_id"])
+                self.assertIsNotNone(d.retry_foreclosed_by, t["transaction_id"])
 
     def test_every_decision_cites_a_resolvable_rule_path(self):
         for t in self.txns:

@@ -71,7 +71,13 @@ COST_PER_CONTACT_PAISE = 100      # Rs 1.00 direct send cost, goodwill excluded
 
 # Guard against a policy that defers forever. Each pass either advances the
 # clock or acts; this caps how many passes one transaction may take.
-MAX_PASSES = 12
+#
+# Raised from 12 when the contact rungs became reachable. A transaction can
+# now spend its retries AND then walk the contact rungs, each of which may
+# defer once for contact hours and once for the 24h spacing rule, before
+# handing off. 12 truncated that tail silently -- the ceiling has to sit above
+# the longest legitimate path or it becomes a stopping rule nobody wrote down.
+MAX_PASSES = 24
 
 
 def _ground_truth_index(path="data/failed_payments.json"):
@@ -146,16 +152,26 @@ def _work_transaction(policy, log, executor, transaction, diagnosis, signals,
         if last_result.get("recovered"):
             break
 
-        # The attempt was spent. Record it and let the policy decide again.
-        state.last_attempt_at = now
+        # The budget was spent. Charge it to the RIGHT one and let the policy
+        # decide again. `consumes` comes from the rung in policy.yaml; reading
+        # it here instead of matching on action names means adding a rung to
+        # the ladder does not require editing this loop, and means a contact
+        # can never silently charge the attempt budget.
+        if d.consumes == "attempt":
+            state.last_attempt_at = now
+            work["attempt_number"] = int(work.get("attempt_number", 1)) + 1
+        elif d.consumes == "contact":
+            # Deliberately does NOT touch last_attempt_at. The retry cooldown
+            # protects the customer's instrument from repeated authorisation
+            # attempts; sending an email is not one, and letting a message
+            # reset that clock would delay a legitimate retry for no reason.
+            state.last_contact_at = now
         if d.customer_visible:
             state.contacts_used += 1
         if d.escalation_step:
             # Highest rung REACHED, never a forced advance past a rung that
             # is still eligible.
             state.escalation_step = max(state.escalation_step, d.escalation_step)
-        if d.action in ("silent_retry", "retry_with_updated_instrument"):
-            work["attempt_number"] = int(work.get("attempt_number", 1)) + 1
         if last_result.get("status") == "handed_off":
             break
 
