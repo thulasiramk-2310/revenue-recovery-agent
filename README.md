@@ -354,11 +354,16 @@ Straight from `policy.yaml`:
 
 ```yaml
 limits:
-  max_attempts: 4                 # total attempts per txn, INCLUDING the
-                                  # original failure that got us here
+  # TWO SEPARATE BUDGETS. Exhausting one must never silently spend or
+  # cancel the other.
+  max_attempts: 4                 # GATEWAY attempts per txn, INCLUDING the
+                                  # original failure. Bounds rungs marked
+                                  # `consumes: attempt` only.
   cooldown_hours: 6               # DEFAULT min gap between two attempts
   max_attempts_per_customer_per_day: 5
-  max_customer_contacts_per_transaction: 2
+  max_customer_contacts_per_transaction: 2      # CONTACT budget
+  max_contacts_per_customer_per_24h: 2          # rolling, per PERSON
+  min_hours_between_contacts: 24
   abort_batch_if_decline_rate_above: 0.85   # circuit breaker
 
 stop_immediately_on:
@@ -388,7 +393,33 @@ in the document was not the schedule that ran, and 40 retries were being
 silently re-timed. Overrides require a stated rationale, and a test asserts
 every configured delay is actually reachable.
 
-60 of the 96 tests target these rules and their ordering.
+### The unmapped-code default
+
+A failure code the taxonomy has never seen routes to `unmapped_code_fallback:
+UNKNOWN` — one retry at +360 minutes under `max_attempts_override: 2`, then
+human review. The delay is deliberately set *at* the default cooldown rather
+than given an override:
+
+```yaml
+    rationale: >
+      Unmapped code. One conservative retry, then human review. The delay is
+      set at the default cooldown rather than given an override: for a
+      failure we do not understand, the cautious default should win.
+      Loosening a limit requires a specific reason, and "we don't know what
+      this is" is the opposite of one.
+```
+
+Worth being precise about the provenance of that rule, because it is about to
+carry more weight than it was built for. It was written in phase 2, to settle
+an argument about the cooldown override — long before any LLM was planned,
+and with no knowledge of what it would later need to protect. When a model is
+wired in to classify unfamiliar gateway messages, **every** way that can fail
+— unmapped code, malformed output, API error, deadline overrun, missing
+credentials — lands here. A conservative default that was argued for on its
+own merits, before the hole it now plugs existed, is a great deal harder to
+attack than one written to plug it.
+
+79 of the 113 tests target these rules and their ordering.
 
 ---
 
