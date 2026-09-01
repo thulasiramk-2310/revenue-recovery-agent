@@ -46,6 +46,15 @@ POLICY_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "policy.yaml"
 )
 
+# data/ is gitignored, so a fresh clone has no batch until generate_data runs.
+# Tests that need the real batch skip rather than error: a clone that reports
+# five errors reads as broken, when the only missing thing is an input the
+# repo deliberately does not ship.
+BATCH_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "failed_payments.json"
+)
+
 BASE_TS = "2026-08-10T14:00:00+05:30"
 
 
@@ -317,6 +326,8 @@ class TestAttemptCaps(PolicyCase):
                 sub, _ = self.policy.effective_max_attempts(code, True)
                 self.assertLessEqual(sub, one_off)
 
+    @unittest.skipUnless(os.path.exists(BATCH_PATH),
+                         "needs data/failed_payments.json -- run python -m src.generate_data")
     def test_cap_is_never_exceeded_anywhere_in_the_real_batch(self):
         # Sweep every transaction at every attempt number and assert no path
         # schedules a retry past its cap.
@@ -1018,6 +1029,8 @@ class TestStructuralGuards(unittest.TestCase):
 
 class TestAuditCoverage(unittest.TestCase):
 
+    @unittest.skipUnless(os.path.exists(BATCH_PATH),
+                         "needs data/failed_payments.json -- run python -m src.generate_data")
     def test_every_decision_writes_exactly_one_line(self):
         policy = load_policy(POLICY_PATH)
         _, _, txns = load_batch()
@@ -1042,6 +1055,8 @@ class TestAuditCoverage(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    @unittest.skipUnless(os.path.exists(BATCH_PATH),
+                         "needs data/failed_payments.json -- run python -m src.generate_data")
     def test_chain_verifies_after_a_full_decision_run(self):
         policy = load_policy(POLICY_PATH)
         _, _, txns = load_batch()
@@ -1097,6 +1112,8 @@ class TestAuditCoverage(unittest.TestCase):
 
 # -- whole-batch invariants ----------------------------------------------
 
+@unittest.skipUnless(os.path.exists(BATCH_PATH),
+                     "needs data/failed_payments.json -- run python -m src.generate_data")
 class TestBatchInvariants(unittest.TestCase):
     """Properties that must hold across all 240 transactions at once."""
 

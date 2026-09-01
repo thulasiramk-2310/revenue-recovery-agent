@@ -360,6 +360,8 @@ class TestRetryAllowanceIsFullyUsed(unittest.TestCase):
 
 
 
+@unittest.skipUnless(os.path.exists(os.path.join(ROOT, "data", "failed_payments.json")),
+                     "needs data/failed_payments.json -- run python -m src.generate_data")
 class TestBaselineIsHonestlyNaive(unittest.TestCase):
     """The baseline must be blind, or the comparison is rigged.
 

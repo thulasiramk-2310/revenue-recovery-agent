@@ -251,6 +251,18 @@ def _work_transaction(policy, log, executor, transaction, diagnosis, signals,
 def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
         limit=None, horizon=DEFAULT_HORIZON, data_path="data/failed_payments.json",
         policy_path="policy.yaml", quiet=False):
+    # data/ is gitignored, so this is the FIRST thing a fresh clone hits if
+    # the quickstart's generate_data step is skipped. A traceback here reads
+    # as a broken project; it is just a missing input, and the fix is one
+    # command.
+    if not os.path.exists(data_path):
+        raise SystemExit(
+            "\nNo batch found at %s.\n\n"
+            "The batch is generated, not committed -- data/ is gitignored so\n"
+            "the repo carries no data anyone could mistake for real payments.\n\n"
+            "Run this first:\n"
+            "    python -m src.generate_data\n" % data_path
+        )
     meta, outages, txns = load_batch(data_path)
     if limit:
         txns = txns[:limit]
