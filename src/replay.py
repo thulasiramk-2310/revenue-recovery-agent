@@ -230,7 +230,9 @@ def rebuild(log_path=DEFAULT_LOG):
                 - (exec_status.get("retry_executed", 0)
                    + exec_status.get("recovered", 0))
                 * costs["per_attempt_paise"]
-                - _customers(contacts) * costs["per_contact_paise"]
+                # len(contacts), not _customers(contacts): cost follows
+                # messages sent, and two messages to one customer cost twice.
+                - len(contacts) * costs["per_contact_paise"]
             ) if costs else None,
             "ceiling": ceiling,
             "baseline": baseline,

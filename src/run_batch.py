@@ -255,12 +255,18 @@ def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
             "per_attempt_paise": COST_PER_ATTEMPT_PAISE,
             "per_contact_paise": COST_PER_CONTACT_PAISE,
         }
+        # Cost is driven by MESSAGES SENT, not by people reached. 133 sends
+        # across 88 customers costs 133 sends. Charging per unique customer
+        # silently discounts every follow-up message, which is precisely the
+        # kind of quiet understatement the cost model exists to prevent.
+        # customers_contacted stays reported, because reach is the right
+        # measure of the goodwill cost that is deliberately NOT monetised.
         summary["net_recovered_paise"] = _net(
             summary["recovered_paise"], summary["attempts_spent"],
-            summary["customers_contacted"])
+            summary["contacts_stubbed"])
         summary["baseline"]["net_recovered_paise"] = _net(
             base["recovered_paise"], base["attempts_spent"],
-            base["customers_contacted"])
+            base["contacts_sent"])
         # The prices belong in the trail. A net figure is unreadable without
         # them, and a reviewer must be able to substitute their own and
         # recompute rather than take ours on faith.
@@ -308,7 +314,7 @@ def _break_even_attempt_cost_paise(summary, base):
     """
     gross_gap = base["recovered_paise"] - summary["recovered_paise"]
     attempt_gap = base["attempts_spent"] - summary["attempts_spent"]
-    contact_gap = summary["customers_contacted"] - base["customers_contacted"]
+    contact_gap = summary["contacts_stubbed"] - base["contacts_sent"]
     if gross_gap <= 0 or attempt_gap <= 0:
         return None
     return (gross_gap + contact_gap * COST_PER_CONTACT_PAISE) / attempt_gap
@@ -415,6 +421,7 @@ def _comparison(summary, base, ceiling, txns, ground_truth, results):
     a_gross, b_gross = summary["recovered_paise"], base["recovered_paise"]
     a_att, b_att = summary["attempts_spent"], base["attempts_spent"]
     a_con, b_con = summary["customers_contacted"], base["customers_contacted"]
+    a_msg, b_msg = summary["contacts_stubbed"], base["contacts_sent"]
     a_net = summary["net_recovered_paise"]
     b_net = summary["baseline"]["net_recovered_paise"]
     a_cost, b_cost = a_gross - a_net, b_gross - b_net
@@ -431,6 +438,7 @@ def _comparison(summary, base, ceiling, txns, ground_truth, results):
           % ("", "%d txns" % summary["recovered_count"],
              "%d txns" % base["recovered_count"]))
     print("  %-24s %16d %16d" % ("Attempts", a_att, b_att))
+    print("  %-24s %16d %16d" % ("Messages sent", a_msg, b_msg))
     print("  %-24s %16d %16d" % ("Customers contacted", a_con, b_con))
     print("  %-24s %16s %16s" % ("Cost", rup(a_cost), rup(b_cost)))
     print("  %-24s %16s %16s" % ("Net recovered", rup(a_net), rup(b_net)))
