@@ -107,22 +107,34 @@ batch total, because the batch total includes money nobody could ever get.
   Gross recovered              Rs 85,228.95     Rs 98,475.41
                                     37 txns          38 txns
   Attempts                              215              693
-  Customers contacted                     0                0
-  Cost                            Rs 537.50      Rs 1,732.50
-  Net recovered                Rs 84,691.45     Rs 96,742.91
+  Messages sent                         406                0
+  Customers contacted                   104                0
+  Cost                            Rs 943.50      Rs 1,732.50
+  Net recovered                Rs 84,285.45     Rs 96,742.91
   Rs per attempt                  Rs 396.41        Rs 142.10
   Capture vs ceiling                  42.1%            48.6%
 ```
 
-Costed at ₹2.50 per gateway attempt and ₹1.00 per contact — assumptions, not
-measurements, and overridable. The goodwill cost of messaging a customer is
-real but not monetary, so contacts get their own column rather than an
-invented rupee figure.
+Costed at ₹2.50 per gateway attempt and ₹1.00 per message — assumptions, not
+measurements, and overridable. Cost follows **messages sent**, not people
+reached: 406 messages to 104 customers costs 406 sends, and charging per
+customer would silently discount every follow-up. Both columns appear because
+they measure different things — sends drive the rupee cost, reach drives the
+goodwill cost, and the goodwill cost is deliberately **not** monetised rather
+than given an invented figure.
 
-**The agent loses on gross by ₹13,246.46 and on net by ₹12,051.46.** Costing
-attempts does not rescue it: an attempt would have to cost ₹27.71 — 11× the
+**The agent loses on gross by ₹13,246.46 and on net by ₹12,457.46.** Costing
+attempts does not rescue it: an attempt would have to cost ₹28.56 — 11× the
 assumption, far above real Indian PG economics — for the efficiency argument
 to carry the result.
+
+The contact rungs recover **₹0**, and that is a property of the data, not a
+finding about dunning. Ground truth models recovery as a function of retry
+*timing* only; a customer receiving an email and updating their card is not
+something this batch represents. Contacts are therefore pure cost here —
+₹406 of the agent's ₹943.50 — and the honest reading is that this
+measurement can show escalation is *compliant and bounded*, not that it
+*works*.
 
 ### Where that gap actually comes from
 
@@ -237,13 +249,86 @@ attempt, making that predicate dead code and giving each transaction exactly
 one retry — worth ₹28,923 of recoverable money. Fixed, with a regression test
 that runs the full loop and asserts both scheduled retries actually fire.
 
-**Known limitation:** stopping rule 3 (`attempt_number >= max_attempts` →
-STOP) is evaluated *before* the ladder, so once retries are exhausted the run
-stops rather than escalating to rungs 3–5. In the current batch that means
-**zero customer contacts**. The ladder is implemented and tested, but under
-the specified enforcement order its contact rungs are unreachable. This is a
-design tension between "attempt caps are absolute" and "escalate when retries
-fail", and it is not resolved.
+### Two budgets, not one
+
+Gateway attempts and customer contacts are separate resources with separate
+caps, and **exhausting one never spends or cancels the other**. Each rung
+declares which it spends:
+
+```yaml
+  - step: 1
+    action: silent_retry
+    consumes: attempt
+    repeatable: true                # each firing is a distinct retry
+  - step: 3
+    action: notify_customer
+    consumes: contact
+    repeatable: false               # twice is a duplicate, not an escalation
+```
+
+This was originally wrong, and wrong in a way that flattered the agent.
+Stopping rules 2 and 3 returned STOP and ended the transaction, so rungs 3–5
+were unreachable: the run made **zero customer contacts**, three of five rungs
+were dead code while `policy.yaml` advertised them, and
+`Customers contacted: 0` sat in the cost table reading like restraint when it
+was a bug.
+
+Rules 2 and 3 now **foreclose retries** rather than ending the transaction. A
+hard decline closes the gateway, not the customer — an expired card is
+precisely the case where asking the customer to act is the only thing that can
+work. Rules 3b, 4 and 5 exist solely to protect the attempt budget, so they are
+skipped once retries are foreclosed; control always reaches the ladder, which
+disables the `consumes: attempt` rungs and keeps descending.
+
+The stopping guarantees did not weaken. They are now enforced in **two**
+independent places: the `retry_permitted` predicate keeps the retry rungs
+ineligible, and `_build_rung_decision` raises `PolicyViolation` if a rung that
+consumes an attempt is ever selected while retries are foreclosed.
+
+The second check exists because the first lives in a YAML file anyone can
+edit. So the test edits it:
+
+```python
+def test_a_ladder_that_drops_retry_permitted_is_refused_not_obeyed(self):
+    # Simulate the dangerous edit: someone removes retry_permitted from the
+    # retry rungs. The bounds must not be cosmetic.
+    for rung in doc["escalation_ladder"]:
+        rung["requires"] = [r for r in rung["requires"]
+                            if r not in ("retry_permitted", "retryable_failure")]
+    with self.assertRaises(PolicyViolation):
+        Policy(doc).decide(txn(failure_code="CARD_BLOCKED"), ...)
+```
+
+That is the answer to "what happens if someone weakens your policy file": the
+run aborts rather than silently retrying a blocked card. A recovery figure
+produced by a policy that has been quietly relaxed is worth less than no
+figure at all, so it fails loudly instead of finishing.
+
+Two further rules turned out to be advertised but never fired, both found only
+once contacts became reachable:
+
+- **Rung 4 never sent.** Rung 3 repeated, spent the whole contact budget on two
+  identical notices, and `request_instrument_update` — the message that
+  actually asks for a new card — never went out. Fixed by `repeatable` above.
+- **`max_attempts_per_customer_per_day` had never once fired**, since phase 1.
+  `TransactionState` carried the field and no caller ever populated it, so every
+  transaction was decided as though its customer had a clean slate.
+  `CustomerLedger` in `src/run_batch.py` now populates it.
+
+Turning contacts on also exposed a limit that did not exist: the
+per-transaction quota is not a limit on what a **person** receives. A customer
+with five failed payments collected ten messages while every transaction stayed
+individually compliant, so `max_contacts_per_customer_per_24h` bounds the
+person, not the payment. It is a **rolling** 24h window — measured by calendar
+day it let 20 message pairs through by straddling midnight, and one customer
+received three messages inside 24 hours with every individual day under the
+limit.
+
+Measured on the run's own audit log: 406 messages, **zero** outside
+09:00–21:00 IST, **zero** transactions over the 2-message quota, **zero** pairs
+closer than the 24h spacing rule, and a worst case of exactly **2** messages to
+any one customer in any rolling 24h window. Across the full 30-day batch the
+most any customer received was 10, spread over 5 separate failed payments.
 
 ---
 
@@ -254,8 +339,8 @@ Enforced in strict order. A later rule can only ever be more restrictive.
 | # | rule | outcome |
 |---|---|---|
 | 1 | customer opt-out | STOP |
-| 2 | `failure_code` in `stop_immediately_on` | STOP |
-| 3 | `attempt_number >= max_attempts` | STOP |
+| 2 | `failure_code` in `stop_immediately_on` | retries foreclosed |
+| 3 | `attempt_number >= max_attempts` | retries foreclosed |
 | 4 | inside the cooldown window | DEFER |
 | 5 | inside an `ISSUER_DEGRADED` window | HOLD until it clears |
 | 6 | otherwise | `retry_windows` + `escalation_ladder` |
@@ -410,7 +495,11 @@ Blunt, because overclaiming is the fastest way to lose a panel round.
 **The agent loses to the naive baseline on gross revenue.** At every window
 width tested, on gross, on net, and like-for-like. The best case is a 0.96%
 deficit. The case for it rests on attempt efficiency, compliance, and zero
-wasted attempts — not on recovering more money.
+wasted attempts — not on recovering more money. Adding the contact rungs made
+this slightly worse, not better: they cost ₹406 and recovered nothing, moving
+the net deficit from ₹12,051.46 to ₹12,457.46. That is reported rather than
+suppressed, because a correctness fix that costs money is still a correctness
+fix.
 
 **The data is synthetic, and it was generated by the same person who is
 being graded on it.** The recovery windows are a model of reality, not
@@ -426,10 +515,20 @@ and no consent system, unsubscribe handling, or delivery-failure path exists.
 would have succeeded is read from planted ground truth. The agent has never
 actually recovered a rupee.
 
-**The escalation ladder's customer-facing rungs are currently unreachable**
-because the attempt cap stops a transaction before the ladder can escalate.
-The rungs are implemented and tested in isolation; in a full run, contacts
-are zero.
+**Escalation is bounded and compliant, but not shown to work.** The contact
+rungs now run — 406 messages across 104 customers, every compliance rail
+verified against the audit log — and they recover **₹0**. Ground truth models
+recovery purely as a function of retry *timing*, so a customer updating their
+card after an email is not something this batch can represent. Contacts are
+pure cost in this measurement. Everything here demonstrates that escalation is
+correctly bounded; nothing here demonstrates that dunning recovers money, and
+the two should not be confused.
+
+**The per-customer contact ledger is order-dependent.** Transactions are worked
+to completion one at a time, so a customer's later transaction sees the contact
+history of the earlier ones but not the reverse. The caps are real bounds on a
+real resource, not an exact simulation of concurrent dunning across a live
+queue.
 
 **Issuer degradation detection is scored against outages this repo planted
 itself.** Recall 0.872 ± 0.118 across 20 seeds is a real measurement of the
