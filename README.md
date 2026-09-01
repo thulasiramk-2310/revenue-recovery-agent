@@ -24,7 +24,7 @@ pip install -r requirements.txt
 python -m src.generate_data          # build the 240-transaction batch
 python -m src.run_batch              # run agent + baseline, print the table
 python -m src.replay --compare       # rebuild the run from its log alone
-python -m unittest discover -s tests # 96 tests
+python -m unittest discover -s tests # 113 tests
 ```
 
 No API keys needed for any of that — the default is a dry run that touches no
@@ -594,7 +594,7 @@ src/sensitivity.py     result vs window width
 baseline/fixed_retry.py  the +1h/+24h/+72h control arm
 policy.yaml            every limit, delay, terminal code and rail
 WINDOW_MODEL.md        pre-registered window widths and justification
-tests/                 96 tests, stdlib unittest
+tests/                 113 tests, stdlib unittest
 ```
 
 Dependencies: PyYAML and python-dotenv. The gateway client is stdlib

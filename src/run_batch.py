@@ -449,8 +449,20 @@ def _report(summary, chain, signals, outages, diagnoses, txns, live):
         print("                       against outages spanning the full month)")
     else:
         sc = score_detections(signals, outages)
-        print("  degradation          %d detected, %d planted -> precision %.2f recall %.2f"
-              % (sc["detected"], sc["planted"], sc["precision"], sc["recall"]))
+        # Print the confusion matrix, not just the two ratios. "7 detected,
+        # 6 planted -> precision 0.71" reads like an arithmetic error: the
+        # obvious mental bound is 6/7 = 0.86, which only holds if all six
+        # planted outages were among the seven found. One was missed, so the
+        # true split is 5 correct of 7 found and 5 found of 6 planted. Making
+        # a reader re-derive that is a good way to have them assume a bug.
+        print("  degradation          %d detected vs %d planted"
+              % (sc["detected"], sc["planted"]))
+        print("                       %d correct, %d false, %d missed"
+              % (sc["true_positives"], sc["false_positives"],
+                 sc["false_negatives"]))
+        print("                       precision %.2f (%d/%d)  recall %.2f (%d/%d)"
+              % (sc["precision"], sc["true_positives"], sc["detected"],
+                 sc["recall"], sc["true_positives"], sc["planted"]))
 
     print("\n  decisions")
     for a, n in sorted(summary["actions"].items(), key=lambda x: -x[1]):
