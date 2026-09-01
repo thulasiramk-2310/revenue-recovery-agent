@@ -36,6 +36,24 @@ limits:
                                   # CONTACT budget. Bounds rungs marked
                                   # `consumes: contact` only, and is checked
                                   # independently of max_attempts.
+  max_contacts_per_customer_per_24h: 2
+                                  # PER CUSTOMER, across all their failed
+                                  # transactions. The per-transaction quota
+                                  # alone is not a limit on what a PERSON
+                                  # receives: a customer with five failed
+                                  # payments would collect ten messages while
+                                  # every transaction stayed individually
+                                  # compliant. Harassment is measured per
+                                  # person, so the ceiling has to be too.
+                                  #
+                                  # A ROLLING 24h window, not a calendar day.
+                                  # Measured as a calendar day this cap let 20
+                                  # message pairs through by straddling
+                                  # midnight, and one customer received three
+                                  # messages inside 24 hours while every
+                                  # individual day stayed under the limit. A
+                                  # ceiling with a documented way around it is
+                                  # not a ceiling.
   min_hours_between_contacts: 24  # Two dunning messages in the same minute is
                                   # harassment even when both are permitted by
                                   # quota. Spacing is a compliance property of
@@ -205,8 +223,8 @@ escalation_ladder:
     action: notify_customer
     description: One transactional message stating the payment failed, with a fix link.
     requires:
-      [contact_quota_remaining, contact_spacing_elapsed, within_contact_hours,
-       consent_on_file]
+      [contact_quota_remaining, customer_contact_quota_remaining,
+       contact_spacing_elapsed, within_contact_hours, consent_on_file]
     consumes: contact
     repeatable: false               # sending this template twice is a
                                     # duplicate, not an escalation. Without
@@ -221,8 +239,8 @@ escalation_ladder:
     action: request_instrument_update
     description: Secure link to replace the expired or blocked instrument.
     requires:
-      [contact_quota_remaining, contact_spacing_elapsed, within_contact_hours,
-       consent_on_file]
+      [contact_quota_remaining, customer_contact_quota_remaining,
+       contact_spacing_elapsed, within_contact_hours, consent_on_file]
     consumes: contact
     repeatable: false
     customer_visible: true

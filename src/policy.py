@@ -135,6 +135,14 @@ class TransactionState:
     """
     escalation_step: int = 0            # highest ladder rung already executed
     contacts_used: int = 0
+    contacts_recent_for_customer: int = 0  # across ALL of this customer's
+                                           # transactions, in a rolling 24h
+    customer_contact_quota_resets_at: Optional[str] = None
+                                           # when the oldest of those ages
+                                           # out. Supplied by the caller's
+                                           # ledger so the policy can defer to
+                                           # it without knowing how contacts
+                                           # are tracked.
     last_attempt_at: Optional[str] = None   # defaults to the failure timestamp
     last_contact_at: Optional[str] = None   # None = never contacted. Tracked
                                             # apart from last_attempt_at: a
@@ -238,6 +246,16 @@ def _p_contact_quota_remaining(ctx):
     )
 
 
+def _p_customer_contact_quota_remaining(ctx):
+    cap = ctx["max_contacts_per_customer_per_24h"]
+    if cap is None:
+        return True, "no per-customer contact cap configured"
+    used = ctx["state"].contacts_recent_for_customer
+    return used < int(cap), (
+        "customer has had %d of %d messages in the last 24h" % (used, int(cap))
+    )
+
+
 def _p_contact_spacing_elapsed(ctx):
     return ctx["contact_spacing_elapsed"], "limits.min_hours_between_contacts"
 
@@ -258,6 +276,9 @@ def _p_consent_on_file(ctx):
 # permanent one. Everything not listed here is a real ineligibility.
 DEFERRABLE_PREDICATES = frozenset({
     "within_contact_hours", "contact_spacing_elapsed",
+    # A daily cap is the clearest "not yet" of the three: it resets at
+    # midnight whether or not anything else changes.
+    "customer_contact_quota_remaining",
 })
 
 PREDICATES = {
@@ -268,6 +289,7 @@ PREDICATES = {
     "alternate_instrument_available": _p_alternate_instrument_available,
     "contact_quota_remaining": _p_contact_quota_remaining,
     "contact_spacing_elapsed": _p_contact_spacing_elapsed,
+    "customer_contact_quota_remaining": _p_customer_contact_quota_remaining,
     "within_contact_hours": _p_within_contact_hours,
     "consent_on_file": _p_consent_on_file,
 }
@@ -577,6 +599,8 @@ class Policy:
         return {
             "within_contact_hours": "compliance.contact_hours_ist",
             "contact_spacing_elapsed": "limits.min_hours_between_contacts",
+            "customer_contact_quota_remaining":
+                "limits.max_contacts_per_customer_per_24h",
         }.get(name, name)
 
     def _deferrable_until(self, ctx, unmet_names, now):
@@ -594,6 +618,11 @@ class Policy:
                     hours=float(self.limits.get("min_hours_between_contacts", 0))))
             elif name == "within_contact_hours":
                 whens.append(self.next_contact_opening(now))
+            elif name == "customer_contact_quota_remaining":
+                # Rolling: eligible again when the oldest message in the
+                # window ages out, which the caller's ledger computes.
+                if state.customer_contact_quota_resets_at:
+                    whens.append(_parse(state.customer_contact_quota_resets_at))
         if not whens:
             return None
         until = max(whens)
@@ -634,6 +663,8 @@ class Policy:
                 self.limits.get("max_customer_contacts_per_transaction", 0)
             ),
             "contact_spacing_elapsed": contact_spacing_elapsed,
+            "max_contacts_per_customer_per_24h": self.limits.get(
+                "max_contacts_per_customer_per_24h"),
             "within_contact_hours": self.within_contact_hours(now),
         }
 

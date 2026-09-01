@@ -92,8 +92,70 @@ def _ground_truth_index(path="data/failed_payments.json"):
             for t in data["transactions"]}
 
 
+class CustomerLedger:
+    """Per-customer, per-day counters shared across the whole batch.
+
+    limits.max_attempts_per_customer_per_day has been in policy.yaml since
+    phase 1 and had never once fired, because TransactionState carried the
+    field and nothing ever populated it. Every transaction was decided as
+    though its customer had a clean slate, so a customer with six failures
+    was six separate first offences. The cap read as enforced in the document
+    and was dead in the run -- the same failure as the unreachable ladder
+    rungs, and worth naming as such rather than quietly fixing.
+
+    Attempts are counted per IST calendar day, matching the wording of
+    limits.max_attempts_per_customer_per_day. Contacts are counted over a
+    ROLLING 24 hours, because that cap exists to stop a person being pestered
+    and a calendar boundary is not something a pestered person experiences --
+    measured by calendar day it let 20 message pairs through by straddling
+    midnight.
+
+    Honest limitation: transactions are worked to completion one at a time,
+    so a customer's later transaction sees the contact history of the earlier
+    ones but not the reverse. The ledger is therefore order-dependent. It is
+    a real bound on a real resource, not an exact simulation of concurrent
+    dunning, and the run reports the resulting distribution rather than
+    asserting the cap held perfectly.
+    """
+
+    WINDOW = timedelta(hours=24)
+
+    def __init__(self):
+        self.attempts = collections.Counter()
+        self.contacts = collections.defaultdict(list)
+
+    @staticmethod
+    def _day(transaction, when):
+        return (transaction.get("customer_id"),
+                datetime.fromisoformat(when).astimezone(IST).date())
+
+    def load(self, state, transaction, when, cap=None):
+        now = datetime.fromisoformat(when)
+        state.attempts_today_for_customer = self.attempts[
+            self._day(transaction, when)]
+
+        sent = sorted(t for t in self.contacts[transaction.get("customer_id")]
+                      if now - t < self.WINDOW)
+        state.contacts_recent_for_customer = len(sent)
+        # When the window frees up a slot: the moment the oldest message that
+        # currently occupies one falls out of it. With a cap of 2 and 2 sent,
+        # that is 24h after the older of the two.
+        if cap and len(sent) >= int(cap):
+            state.customer_contact_quota_resets_at = (
+                sent[len(sent) - int(cap)] + self.WINDOW).isoformat()
+        else:
+            state.customer_contact_quota_resets_at = None
+
+    def charge(self, transaction, when, consumes):
+        if consumes == "attempt":
+            self.attempts[self._day(transaction, when)] += 1
+        elif consumes == "contact":
+            self.contacts[transaction.get("customer_id")].append(
+                datetime.fromisoformat(when))
+
+
 def _work_transaction(policy, log, executor, transaction, diagnosis, signals,
-                      horizon):
+                      horizon, ledger=None):
     """Work one transaction the way an agent actually would: as a queue item.
 
     The clock starts when the payment failed and advances only as the policy
@@ -116,6 +178,12 @@ def _work_transaction(policy, log, executor, transaction, diagnosis, signals,
     last_decision = last_result = None
 
     for _ in range(MAX_PASSES):
+        # Refresh the cross-transaction counters for whatever day the clock
+        # has reached, so the per-customer caps are evaluated against the
+        # customer's real history rather than a blank slate.
+        if ledger is not None:
+            ledger.load(state, work, now,
+                        cap=policy.limits.get("max_contacts_per_customer_per_24h"))
         d = decide_and_log(policy, log, work, diagnosis,
                            state=state, batch_signals=signals, now=now)
         last_decision = d
@@ -157,6 +225,8 @@ def _work_transaction(policy, log, executor, transaction, diagnosis, signals,
         # it here instead of matching on action names means adding a rung to
         # the ladder does not require editing this loop, and means a contact
         # can never silently charge the attempt budget.
+        if ledger is not None:
+            ledger.charge(work, now, d.consumes)
         if d.consumes == "attempt":
             state.last_attempt_at = now
             work["attempt_number"] = int(work.get("attempt_number", 1)) + 1
@@ -216,10 +286,12 @@ def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
         diagnoses, signals = diagnose_batch(txns, audit=log)
 
         results, decisions = {}, {}
+        ledger = CustomerLedger()
         for t in txns:
             tid = t["transaction_id"]
             final_decision, final_result = _work_transaction(
-                policy, log, executor, t, diagnoses[tid], signals, horizon
+                policy, log, executor, t, diagnoses[tid], signals, horizon,
+                ledger=ledger,
             )
             decisions[tid] = final_decision
             results[tid] = final_result

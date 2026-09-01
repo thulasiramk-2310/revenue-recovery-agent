@@ -726,6 +726,78 @@ class TestEscalationActuallyRuns(PolicyCase):
                           "rung %s must declare consumes" % rung["step"])
 
 
+# -- per-customer limits --------------------------------------------------
+
+class TestPerCustomerLimits(PolicyCase):
+
+    def test_customer_contact_cap_is_enforced_across_transactions(self):
+        # A cap that only counts within one transaction is not a cap on what
+        # a person receives.
+        cap = int(self.policy.limits["max_contacts_per_customer_per_24h"])
+        state = TransactionState(
+            consent_on_file=True,
+            contacts_recent_for_customer=cap,
+            customer_contact_quota_resets_at="2026-08-12T10:00:00+05:30",
+        )
+        d = self.decide(txn(failure_code="CARD_EXPIRED"), state,
+                        now="2026-08-11T11:00:00+05:30")
+        self.assertEqual(d.action, DEFER)
+        self.assertIn("limits.max_contacts_per_customer_per_24h", d.bounded_by)
+
+    def test_customer_contact_cap_defers_rather_than_abandons(self):
+        # It is a rolling window, so the right response is to wait for a slot,
+        # not to drop the message.
+        cap = int(self.policy.limits["max_contacts_per_customer_per_24h"])
+        resets = "2026-08-12T10:00:00+05:30"
+        state = TransactionState(
+            consent_on_file=True,
+            contacts_recent_for_customer=cap,
+            customer_contact_quota_resets_at=resets,
+        )
+        d = self.decide(txn(failure_code="CARD_EXPIRED"), state,
+                        now="2026-08-11T11:00:00+05:30")
+        self.assertIsNotNone(d.scheduled_time)
+        self.assertGreaterEqual(datetime.fromisoformat(d.scheduled_time),
+                                datetime.fromisoformat(resets))
+
+    def test_under_the_customer_cap_the_contact_proceeds(self):
+        state = TransactionState(consent_on_file=True,
+                                 contacts_recent_for_customer=0)
+        d = self.decide(txn(failure_code="CARD_EXPIRED"), state,
+                        now="2026-08-11T11:00:00+05:30")
+        self.assertTrue(d.customer_visible)
+
+    def test_the_orchestrator_actually_populates_per_customer_state(self):
+        # The failure mode this guards is not a wrong value, it is a field
+        # nobody ever writes to -- which is how max_attempts_per_customer_per_day
+        # sat in policy.yaml for the whole project without ever firing.
+        from src.run_batch import CustomerLedger
+        led = CustomerLedger()
+        t = {"customer_id": "cust_1", "transaction_id": "t1"}
+        when = "2026-08-11T11:00:00+05:30"
+        st = TransactionState()
+        led.charge(t, when, "contact")
+        led.charge(t, when, "attempt")
+        led.load(st, t, when, cap=2)
+        self.assertEqual(st.contacts_recent_for_customer, 1)
+        self.assertEqual(st.attempts_today_for_customer, 1)
+
+    def test_the_customer_window_is_rolling_not_calendar(self):
+        # Measured by calendar day, two messages 2h apart across midnight both
+        # count as "first of the day". The window has to be rolling or the cap
+        # has a documented way around it.
+        from src.run_batch import CustomerLedger
+        led = CustomerLedger()
+        t = {"customer_id": "cust_1", "transaction_id": "t1"}
+        led.charge(t, "2026-08-11T23:00:00+05:30", "contact")
+        led.charge(t, "2026-08-12T01:00:00+05:30", "contact")
+        st = TransactionState()
+        led.load(st, t, "2026-08-12T02:00:00+05:30", cap=2)
+        self.assertEqual(st.contacts_recent_for_customer, 2,
+                         "both messages are inside the rolling 24h window")
+        self.assertIsNotNone(st.customer_contact_quota_resets_at)
+
+
 # -- compliance -----------------------------------------------------------
 
 class TestComplianceRails(PolicyCase):
