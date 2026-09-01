@@ -128,7 +128,9 @@ def _work_transaction(policy, log, executor, transaction, diagnosis, signals,
         if d.customer_visible:
             state.contacts_used += 1
         if d.escalation_step:
-            state.escalation_step = d.escalation_step
+            # Highest rung REACHED, never a forced advance past a rung that
+            # is still eligible.
+            state.escalation_step = max(state.escalation_step, d.escalation_step)
         if d.action in ("silent_retry", "retry_with_updated_instrument"):
             work["attempt_number"] = int(work.get("attempt_number", 1)) + 1
         if last_result.get("status") == "handed_off":

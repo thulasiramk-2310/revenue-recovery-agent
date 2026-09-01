@@ -30,9 +30,13 @@ from src import audit as audit_mod
 from src.execute import (
     Executor, LiveKeyRefused, RateLimiter, SecretLeak, mask,
 )
-from src.policy import Decision
+from src.policy import Decision, load_policy
+from src.diagnose import diagnose
+from src.run_batch import DEFAULT_HORIZON, _work_transaction
 from src.replay import rebuild, story
 
+POLICY_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "policy.yaml")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG = os.path.join(ROOT, "results", "run.log")
 SUMMARY = os.path.join(ROOT, "results", "run_summary.json")
@@ -260,6 +264,99 @@ class TestReplayReconstructsTheRun(unittest.TestCase):
             self.assertFalse(audit_mod.verify_chain(path)["ok"])
         finally:
             os.unlink(path)
+
+
+
+class TestRetryAllowanceIsFullyUsed(unittest.TestCase):
+    """Regression: a transaction with two scheduled retries must use both.
+
+    The defect this guards against was subtle. The escalation ladder advanced
+    one rung after every attempt, so rung 1 (silent_retry) could fire exactly
+    once per transaction no matter how many retries policy.yaml allowed. That
+    made `attempts_remaining` -- rung 1's own precondition, and the thing that
+    is supposed to govern repetition -- dead code.
+
+    Nothing crashed and no test failed, because the unit tests only asserted
+    that the ladder never SKIPPED a rung, never that a still-eligible rung
+    could fire again. The only visible symptom was recovered money:
+    Rs 75,192 instead of Rs 104,115 on the standard batch.
+
+    So this test runs the real scheduling loop end to end rather than probing
+    the policy in isolation. INSUFFICIENT_FUNDS declares two delays
+    (+1 day, +3 days) and therefore an allowance of two retries; both must
+    actually be spent.
+    """
+
+    def setUp(self):
+        self.policy = load_policy(POLICY_PATH)
+        self.txn = {
+            "transaction_id": "pay_REGR01", "amount_paise": 249900,
+            "timestamp": "2026-08-10T14:00:00+05:30", "issuer_bank": "HDFC",
+            "failure_code": "INSUFFICIENT_FUNDS", "customer_id": "cust_regr",
+            "attempt_number": 1, "is_subscription": False,
+        }
+        # Never recoverable, so the loop cannot exit early on success and we
+        # observe the full allowance being spent rather than a lucky first hit.
+        self.gt = {"pay_REGR01": {"is_recoverable": False,
+                                  "recovery_reason": "fixture: never recovers"}}
+
+    def _run(self):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        try:
+            with audit_mod.AuditLog(path, dry_run=True) as log:
+                ex = Executor(audit=log, policy=self.policy,
+                              ground_truth=self.gt)
+                diag = diagnose(self.txn, [])
+                _work_transaction(self.policy, log, ex, self.txn, diag, [],
+                                  DEFAULT_HORIZON)
+            return ex, list(audit_mod.read_entries(path))
+        finally:
+            os.unlink(path)
+
+    def test_the_declared_retry_allowance_is_two(self):
+        delays = self.policy.retry_windows["INSUFFICIENT_FUNDS"]["delays_minutes"]
+        self.assertEqual(len(delays), 2,
+                         "fixture assumes two scheduled retries for this code")
+        eff, _ = self.policy.effective_max_attempts("INSUFFICIENT_FUNDS", False)
+        self.assertEqual(eff, len(delays) + 1)
+
+    def test_both_scheduled_retries_are_actually_used(self):
+        ex, _ = self._run()
+        self.assertEqual(
+            ex.stats["attempts"], 2,
+            "the policy schedules two retries for INSUFFICIENT_FUNDS but the "
+            "loop spent %d. A rung that stops firing while attempts_remaining "
+            "is still true makes that predicate meaningless."
+            % ex.stats["attempts"],
+        )
+
+    def test_the_two_retries_land_at_the_two_configured_delays(self):
+        # Using both attempts is not enough -- they have to be spent at the
+        # times the document specifies, or the schedule is decorative.
+        _, entries = self._run()
+        fired = [e for e in entries
+                 if e.get("decision") == "retry_scheduled"
+                 and e.get("action") == "silent_retry"]
+        self.assertEqual(len(fired), 2)
+        rules = [e["policy_rule_applied"] for e in fired]
+        self.assertNotEqual(rules[0], rules[1],
+                            "both retries cite the same rule path, so the "
+                            "second is a repeat of the first rather than the "
+                            "next step in the schedule")
+
+    def test_the_ladder_only_escalates_once_retries_are_exhausted(self):
+        _, entries = self._run()
+        # Policy lines only. The executor writes its own line per attempt
+        # carrying the same action but no rung, and including those would
+        # make the sequence look like it oscillates when it does not.
+        seq = [e.get("escalation_step") for e in entries
+               if e.get("decision") == "retry_scheduled"
+               and e.get("action") == "silent_retry"]
+        self.assertTrue(seq, "no silent retries were attempted at all")
+        self.assertTrue(all(s == 1 for s in seq),
+                        "silent_retry should stay on rung 1 for the whole "
+                        "allowance, got rungs %s" % seq)
 
 
 if __name__ == "__main__":

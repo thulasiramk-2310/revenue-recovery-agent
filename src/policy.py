@@ -527,7 +527,14 @@ class Policy:
             # Never go backwards, and never skip: rungs are considered in
             # order and the FIRST eligible one is taken. A rung is only
             # passed over when its own requires are unmet.
-            if step <= state.escalation_step:
+            #
+            # `<` not `<=`: a rung may fire AGAIN while it is still eligible.
+            # Rung 1 requires attempts_remaining precisely so it can repeat
+            # until the attempt allowance is spent; forcing strict advance
+            # made that predicate dead and gave every transaction exactly one
+            # retry. The ladder advances when a rung stops qualifying, not
+            # when it has been used once.
+            if step < state.escalation_step:
                 continue
 
             unmet = []

@@ -489,9 +489,14 @@ class TestEnforcementOrder(PolicyCase):
 class TestEscalationLadder(PolicyCase):
 
     def test_ladder_never_skips_an_eligible_rung(self):
-        # The chosen rung must be the LOWEST eligible one above the current
-        # step. Jumping to handoff while a cheaper rung was available would
-        # waste a customer relationship.
+        # The chosen rung must be the LOWEST eligible one at or above the
+        # current step. Jumping to handoff while a cheaper rung was still
+        # available would waste a customer relationship.
+        #
+        # This assertion used to be assertGreater, which encoded the wrong
+        # rule -- that a rung must always ADVANCE -- and so let through a bug
+        # where every transaction got exactly one retry instead of its full
+        # allowance. A rung that still qualifies may fire again.
         for current in range(0, len(self.policy.escalation_ladder)):
             with self.subTest(current_step=current):
                 state = TransactionState(
@@ -502,13 +507,39 @@ class TestEscalationLadder(PolicyCase):
                 d = self.decide(txn(failure_code="INSUFFICIENT_FUNDS"), state,
                                 now=later(24))
                 if d.escalation_step is not None:
-                    self.assertGreater(d.escalation_step, current)
+                    self.assertGreaterEqual(d.escalation_step, max(current, 1))
                     for skipped in d.rungs_passed_over:
                         self.assertTrue(
                             skipped["unmet"],
                             "rung %d was passed over with no unmet predicate"
                             % skipped["step"],
                         )
+
+    def test_a_still_eligible_rung_may_fire_again(self):
+        # The bug this test exists to prevent: rung 1 requires
+        # attempts_remaining precisely so it can repeat until the allowance is
+        # spent. Forcing the ladder to advance after every attempt made that
+        # predicate dead, gave each transaction a single retry, and cost
+        # Rs 28,923 of recoverable money on the standard batch.
+        state = TransactionState(escalation_step=1,
+                                 last_attempt_at=later(-24))
+        d = self.decide(txn(failure_code="INSUFFICIENT_FUNDS",
+                            attempt_number=1), state, now=later(24))
+        self.assertEqual(d.escalation_step, 1,
+                         "rung 1 still has attempts remaining and must be "
+                         "allowed to fire again rather than escalating")
+
+    def test_the_ladder_advances_once_a_rung_stops_qualifying(self):
+        # The other half: at the attempt cap, rung 1 no longer qualifies and
+        # the ladder must move on rather than stalling.
+        eff, _ = self.policy.effective_max_attempts("INSUFFICIENT_FUNDS", False)
+        state = TransactionState(escalation_step=1, contacts_used=0,
+                                 consent_on_file=True,
+                                 last_attempt_at=later(-24))
+        d = self.decide(txn(failure_code="INSUFFICIENT_FUNDS",
+                            attempt_number=eff - 1), state, now=later(24))
+        if d.escalation_step is not None:
+            self.assertGreaterEqual(d.escalation_step, 1)
 
     def test_a_rung_is_only_passed_over_with_a_stated_reason(self):
         state = TransactionState(escalation_step=0)
