@@ -35,6 +35,12 @@ import sys
 
 from .audit import read_entries, verify_chain
 
+# Fields the AuditLog wraps every entry in. Stripped when an event's payload
+# is rebuilt as data, so a reconstruction is compared on content rather than
+# on the envelope that carried it.
+ENVELOPE = {"event", "hash", "prev_hash", "entry_hash", "ts", "timestamp",
+            "run_id", "seq", "schema", "schema_version"}
+
 DEFAULT_LOG = "results/run.log"
 DEFAULT_SUMMARY = "results/run_summary.json"
 
@@ -57,12 +63,30 @@ FINAL_STATUS_FROM_EVENT = {
 }
 
 
+def _customers(contacts):
+    """Unique customers contacted, rebuilt from the contact lines alone.
+
+    Counted by customer rather than by message: two emails to one person is
+    one person bothered, and that is the number the baseline comparison needs.
+    The id lives inside the logged payload, which is the point of logging the
+    payload in full.
+    """
+    seen = set()
+    for c in contacts:
+        payload = c.get("intended_payload") or {}
+        cid = (payload.get("to") or {}).get("customer_id")
+        if cid:
+            seen.add(cid)
+    return len(seen)
+
+
 def rebuild(log_path=DEFAULT_LOG):
     """Rebuild the whole run from the log. Returns a reconstruction dict."""
     chain = verify_chain(log_path)
 
     run_context = {}
     final_status = {}
+    ceiling = baseline = costs = None
     detections, diagnoses = [], {}
     decisions, executions = {}, {}
     contacts, gateway_calls, backoffs, reconciles = [], [], [], []
@@ -92,10 +116,14 @@ def rebuild(log_path=DEFAULT_LOG):
             contacts.append(e)
         elif kind in FINAL_STATUS_FROM_EVENT:
             final_status[tid] = FINAL_STATUS_FROM_EVENT[kind]
+        elif kind == "cost_model":
+            costs = {k: v for k, v in e.items() if k not in ENVELOPE}
+        elif kind == "recoverable_ceiling":
+            ceiling = {k: v for k, v in e.items() if k not in ENVELOPE}
+        elif kind == "baseline_scored":
+            baseline = {k: v for k, v in e.items() if k not in ENVELOPE}
         elif kind == "run_summary":
-            logged_summary = {k: v for k, v in e.items()
-                              if k not in ("event", "hash", "prev_hash",
-                                           "ts", "run_id", "seq", "schema")}
+            logged_summary = {k: v for k, v in e.items() if k not in ENVELOPE}
         elif e.get("decision"):
             # A decision line. The policy layer and the execution layer both
             # write these; the execution ones carry an outcome_source.
@@ -188,6 +216,26 @@ def rebuild(log_path=DEFAULT_LOG):
             "gateway_calls": len(gateway_calls),
             "final_status": dict(collections.Counter(final_status.values())),
             "execution_events": dict(exec_status),
+            "customers_contacted": _customers(contacts),
+            # Gateway attempts the agent spent, rebuilt by counting the
+            # execution lines rather than trusting a reported total.
+            "attempts_spent": (exec_status.get("retry_executed", 0)
+                               + exec_status.get("recovered", 0)),
+            "costs": costs,
+            # Net is RECOMPUTED from the rebuilt attempt and contact counts
+            # using the logged prices -- not copied from the run's claim.
+            # Reading the claimed net back would test nothing.
+            "net_recovered_paise": (
+                recovered_paise
+                - (exec_status.get("retry_executed", 0)
+                   + exec_status.get("recovered", 0))
+                * costs["per_attempt_paise"]
+                - _customers(contacts) * costs["per_contact_paise"]
+            ) if costs else None,
+            "ceiling": ceiling,
+            "baseline": baseline,
+            "uplift_paise": ((recovered_paise - baseline["recovered_paise"])
+                             if baseline else None),
         },
         "logged_summary": logged_summary,
         "latency_ms": {

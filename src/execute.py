@@ -170,6 +170,50 @@ class RateLimiter:
     sleep = _sleep
 
 
+# -- outcome resolution (shared by the agent and the baseline) ------------
+
+def resolve_outcome(gt_entry, attempted_at):
+    """Did an attempt at this instant recover the payment?
+
+    Ground truth, read ONLY to score, never to choose what to do.
+
+    The recovery WINDOW is the whole point. Money arrives and is then spent
+    again, so an attempt outside [would_recover_if_retried_at,
+    recovery_window_closes_at] fails even for a payment that was genuinely
+    recoverable. Without that, "retry everything constantly" wins trivially
+    and beating the baseline would mean nothing.
+
+    Deliberately a free function, not a method: src/run_batch.py scores the
+    agent through this, and baseline/fixed_retry.py scores the control arm
+    through the same call. Identical accounting for both arms is what makes
+    the comparison evidence rather than assertion.
+
+    Returns (recovered: bool, why: str, window: dict|None).
+    """
+    if not gt_entry:
+        return False, "no ground truth for this transaction", None
+    if not gt_entry.get("is_recoverable"):
+        return False, gt_entry.get("recovery_reason") or "not recoverable", None
+
+    opens = gt_entry.get("would_recover_if_retried_at")
+    closes = gt_entry.get("recovery_window_closes_at")
+    if not opens:
+        return False, "no recovery window", None
+
+    t = _parse(attempted_at)
+    o = _parse(opens)
+    c = _parse(closes) if closes else None
+    window = {"window_opens": opens, "window_closes": closes}
+
+    if t < o:
+        return False, "attempted %.1fh before the recovery window opened" % (
+            (o - t).total_seconds() / 3600.0), window
+    if c and t > c:
+        return False, "attempted %.1fh after the recovery window closed" % (
+            (t - c).total_seconds() / 3600.0), window
+    return True, gt_entry.get("recovery_reason") or "inside the recovery window", window
+
+
 # -- the executor ---------------------------------------------------------
 
 class Executor:
@@ -201,6 +245,11 @@ class Executor:
         # for the same contact are two lines), so counting from there
         # double-counts and the replay comparison rightly fails.
         self.audit_decisions = collections.Counter()
+        # Unique customers who received a (stubbed) message. Counted by
+        # customer, not by contact: two messages to one person is one person
+        # bothered, and "customers contacted" is the number that matters when
+        # comparing against a baseline that contacts nobody.
+        self.customers_contacted = set()
 
         if self.live:
             self._assert_test_mode()
@@ -382,34 +431,14 @@ class Executor:
     def _resolve_outcome(self, transaction, attempted_at):
         """Did this attempt recover the payment?
 
-        Ground truth, read ONLY to score, never to choose what to do. The
-        window is the point: money arrives, then gets spent again, so a retry
-        outside it fails even though the payment was 'recoverable'.
+        Delegates to the module-level resolver so that the agent and the
+        fixed-retry baseline are scored by literally the same code. Two
+        parallel implementations would be free to drift, and a comparison
+        where each arm marks its own homework proves nothing.
         """
-        gt = self.ground_truth.get(transaction["transaction_id"])
-        if not gt:
-            return False, "no ground truth for this transaction", None
-        if not gt.get("is_recoverable"):
-            return False, gt.get("recovery_reason") or "not recoverable", None
-
-        opens = gt.get("would_recover_if_retried_at")
-        closes = gt.get("recovery_window_closes_at")
-        if not opens:
-            return False, "no recovery window", None
-
-        t = _parse(attempted_at)
-        o = _parse(opens)
-        c = _parse(closes) if closes else None
-
-        if t < o:
-            return False, "attempted %.1fh before the recovery window opened" % (
-                (o - t).total_seconds() / 3600.0), {"window_opens": opens, "window_closes": closes}
-        if c and t > c:
-            return False, "attempted %.1fh after the recovery window closed" % (
-                (t - c).total_seconds() / 3600.0), {"window_opens": opens, "window_closes": closes}
-        return True, gt.get("recovery_reason") or "inside the recovery window", {
-            "window_opens": opens, "window_closes": closes,
-        }
+        return resolve_outcome(
+            self.ground_truth.get(transaction["transaction_id"]), attempted_at
+        )
 
     # -- the public entry point ------------------------------------------
 
@@ -529,6 +558,7 @@ class Executor:
         txn_id = transaction["transaction_id"]
         channel = getattr(decision, "channel", None) or "email"
         self.stats["contacts_stubbed"] += 1
+        self.customers_contacted.add(transaction.get("customer_id"))
 
         rupees = transaction["amount_paise"] / 100.0
         payload = {

@@ -359,5 +359,109 @@ class TestRetryAllowanceIsFullyUsed(unittest.TestCase):
                         "allowance, got rungs %s" % seq)
 
 
+
+class TestBaselineIsHonestlyNaive(unittest.TestCase):
+    """The baseline must be blind, or the comparison is rigged.
+
+    A fixed-retry system has no diagnosis layer. That is the whole point of
+    it: it cannot tell a temporary network fault from a closed account, so it
+    retries both on the same schedule and wastes attempts on the second.
+
+    If the baseline quietly skipped hard declines it would be using knowledge
+    the agent is being credited for having, and beating it would prove
+    nothing. These tests exist so that can never happen silently -- a future
+    edit that makes the baseline smarter fails here rather than flattering
+    the headline number.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from src.generate_data import load_batch
+        from src.run_batch import _ground_truth_index
+        from baseline.fixed_retry import FIXED_SCHEDULE_HOURS, run_baseline
+        _, _, cls.txns = load_batch()
+        cls.gt = _ground_truth_index()
+        cls.schedule = FIXED_SCHEDULE_HOURS
+        cls.result = run_baseline(cls.txns, cls.gt)
+        cls.policy = load_policy(POLICY_PATH)
+
+    def test_the_baseline_retries_every_hard_decline(self):
+        # Every terminal-coded transaction must receive the full schedule.
+        # policy.yaml's stop_immediately_on is the agent's knowledge; the
+        # baseline is not entitled to it.
+        per = self.result["per_transaction"]
+        for t in self.txns:
+            if t["failure_code"] not in self.policy.stop_immediately_on:
+                continue
+            with self.subTest(txn=t["transaction_id"], code=t["failure_code"]):
+                self.assertEqual(
+                    per[t["transaction_id"]]["attempts"], len(self.schedule),
+                    "the baseline gave %s (%s) fewer than the full %d "
+                    "attempts -- it is diagnosing, which makes it smarter "
+                    "than a blind retry schedule should be"
+                    % (t["transaction_id"], t["failure_code"],
+                       len(self.schedule)),
+                )
+
+    def test_the_baseline_recovers_a_hard_decline_only_where_truth_allows(self):
+        # Not "recovers nothing from hard declines" -- that assertion was
+        # wrong and this test caught it. The generator plants CARD_BLOCKED
+        # transactions that are temporary fraud holds and WOULD clear on
+        # retry. The blind baseline retries them and collects the money;
+        # policy.yaml forbids the agent from touching them.
+        #
+        # That is the compliance cost made concrete, and it belongs in the
+        # comparison rather than being assumed away. What must never happen
+        # is the baseline recovering something ground truth says is dead.
+        per = self.result["per_transaction"]
+        for t in self.txns:
+            if t["failure_code"] not in self.policy.stop_immediately_on:
+                continue
+            tid = t["transaction_id"]
+            if per[tid]["recovered"]:
+                with self.subTest(txn=tid):
+                    self.assertTrue(
+                        self.gt[tid].get("is_recoverable"),
+                        "the baseline recovered %s, which ground truth says "
+                        "was never recoverable -- the scorer is wrong" % tid,
+                    )
+
+    def test_the_compliance_cost_is_visible_and_nonzero(self):
+        # The batch must actually contain the tension the project claims to
+        # demonstrate. If no terminal-coded transaction is recoverable, the
+        # "money we deliberately do not chase" story is untested decoration.
+        forgone = [t for t in self.txns
+                   if t["failure_code"] in self.policy.stop_immediately_on
+                   and self.gt[t["transaction_id"]].get("is_recoverable")]
+        self.assertGreater(
+            len(forgone), 0,
+            "no terminal-coded transaction is recoverable, so the compliance "
+            "trade-off this project reports is not present in the data",
+        )
+
+    def test_the_wasted_attempts_are_counted_and_reported(self):
+        # The waste has to be visible in the result, not inferred by a reader.
+        self.assertGreater(self.result["attempts_on_unrecoverable"], 0)
+        self.assertGreater(self.result["unrecoverable_transactions_retried"], 0)
+
+    def test_the_baseline_applies_one_schedule_to_every_failure_code(self):
+        # No per-code branching anywhere: every transaction either runs the
+        # full schedule or stops early because it succeeded.
+        per = self.result["per_transaction"]
+        for tid, row in per.items():
+            with self.subTest(txn=tid):
+                if not row["recovered"]:
+                    self.assertEqual(row["attempts"], len(self.schedule))
+                else:
+                    self.assertLessEqual(row["attempts"], len(self.schedule))
+
+    def test_both_arms_are_scored_by_the_same_function(self):
+        # If the two arms ever get separate scorers they are free to drift,
+        # and each would effectively be marking its own homework.
+        import baseline.fixed_retry as fr
+        from src.execute import resolve_outcome
+        self.assertIs(fr.resolve_outcome, resolve_outcome)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
