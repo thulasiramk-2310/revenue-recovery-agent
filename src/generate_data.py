@@ -211,13 +211,33 @@ def _next_salary_window(rng, after):
     return after + timedelta(days=7)
 
 
-def _ground_truth(rng, code, failed_at, outage):
+def _ground_truth(rng, code, failed_at, outage, width_rng=None):
     """When -- if ever -- a retry would actually clear, and for how long.
 
     Returns the opening and closing of the recovery window. A retry outside
     [opens, closes] fails even though the payment was recoverable, which is
     what makes retry TIMING worth optimising rather than just retry COUNT.
+
+    WINDOW WIDTHS COME FROM A SEPARATE RANDOM STREAM
+    -----------------------------------------------
+    `width_rng` is deliberately independent of `rng`, and the main stream
+    still makes its original draw at its original range even where the value
+    is discarded.
+
+    This is not fussiness. random.randint consumes a variable number of
+    underlying bits depending on how wide its range is, so simply editing a
+    range desynchronises every later draw in the shared stream. When the
+    widths were first corrected that changed the batch itself -- the
+    recoverable ceiling moved from 112 transactions to 94 and total value
+    from Rs 542,522.78 to Rs 485,292.13 -- which would have made the
+    before/after comparison meaningless, because two things changed at once.
+
+    Isolating the width draws means a width can never alter WHICH
+    transactions exist, which are recoverable, or what they are worth. That
+    is what WINDOW_MODEL.md commits to, so it is enforced here rather than
+    hoped for.
     """
+    side = width_rng or rng
     if rng.random() >= RECOVERABLE_RATE.get(code, 0.0):
         reason = {
             "ACCOUNT_CLOSED": "account permanently closed; no retry can succeed",
@@ -233,7 +253,11 @@ def _ground_truth(rng, code, failed_at, outage):
 
     if code == "NETWORK_TIMEOUT":
         opens = failed_at + timedelta(minutes=rng.randint(1, 20))
-        closes = opens + timedelta(days=rng.randint(5, 14))
+        # Minutes, not days. See WINDOW_MODEL.md: the transport fault is gone
+        # almost immediately, and what remains is a live checkout session that
+        # ends when the customer gives up and leaves.
+        rng.randint(5, 14)            # stream-preserving; value discarded
+        closes = opens + timedelta(minutes=side.randint(5, 30))
         return opens, closes, "transient network fault; clears almost immediately"
 
     if code == "ISSUER_DOWN":
@@ -243,7 +267,11 @@ def _ground_truth(rng, code, failed_at, outage):
         else:
             opens = failed_at + timedelta(minutes=rng.randint(30, 180))
             why = "unflagged short issuer degradation; self-resolves"
-        return opens, opens + timedelta(days=rng.randint(4, 12)), why
+        # Bounded by the incident and the customer's patience, not by a
+        # multi-day slab. This is what makes holding through an outage worth
+        # anything -- see WINDOW_MODEL.md.
+        rng.randint(4, 12)            # stream-preserving; value discarded
+        return opens, opens + timedelta(minutes=side.randint(30, 240)), why
 
     if code == "INSUFFICIENT_FUNDS":
         # Split deliberately: not everyone waits for payday. The fast half is
@@ -255,12 +283,20 @@ def _ground_truth(rng, code, failed_at, outage):
         else:
             opens = _next_salary_window(rng, failed_at)
             why = "balance restored at monthly salary credit"
-        # Money does not sit there forever -- the window closes as it is spent.
-        return opens, opens + timedelta(days=rng.randint(3, 9)), why
+        # A credit event, not a span: the money lands and is spent within a
+        # day or so. A five-day window described the opposite of the liquidity
+        # pattern that caused the failure. See WINDOW_MODEL.md.
+        rng.randint(3, 9)             # stream-preserving; value discarded
+        return opens, opens + timedelta(hours=side.randint(18, 36)), why
 
     if code == "DO_NOT_HONOR":
+        # Deliberately left WIDE. Issuer discretion genuinely is not tightly
+        # bounded, and a narrow value here would be false precision invented
+        # to help the agent. Holding one code wide is a check on the whole
+        # correction -- see WINDOW_MODEL.md.
         opens = failed_at + timedelta(hours=rng.randint(6, 96))
-        return opens, opens + timedelta(days=rng.randint(3, 10)), "soft velocity/risk block lifted by issuer"
+        rng.randint(3, 10)            # stream-preserving; value discarded
+        return opens, opens + timedelta(days=side.randint(3, 10)), "soft velocity/risk block lifted by issuer"
 
     if code == "CARD_BLOCKED":
         # Deliberate honesty knob: a small slice of blocks are temporary fraud
@@ -268,7 +304,8 @@ def _ground_truth(rng, code, failed_at, outage):
         # money is knowingly left on the table. The report should say so rather
         # than quietly tune the policy to grab it.
         opens = failed_at + timedelta(hours=rng.randint(12, 120))
-        return opens, opens + timedelta(days=rng.randint(2, 6)), "temporary fraud hold released by issuer"
+        rng.randint(2, 6)             # stream-preserving; value discarded
+        return opens, opens + timedelta(days=side.randint(2, 6)), "temporary fraud hold released by issuer"
 
     return None, None, "not recoverable by retry"
 
@@ -277,6 +314,11 @@ def _ground_truth(rng, code, failed_at, outage):
 
 def generate(count=240, seed=42):
     rng = random.Random(seed)
+    # Recovery-window WIDTHS are drawn from their own stream, so that
+    # changing a width cannot perturb the batch itself. Derived from the same
+    # seed, so a run stays fully reproducible from `--seed` alone.
+    # See the note in _ground_truth for why this is necessary rather than tidy.
+    width_rng = random.Random(seed * 7919 + 13)
     start = BATCH_END - timedelta(days=BATCH_DAYS)
     outages = _build_outages(rng, start, BATCH_END)
 
@@ -341,7 +383,7 @@ def generate(count=240, seed=42):
 
         is_sub = rng.random() < (0.42 if cust in chronic else 0.25)
         amount = _realistic_amount(rng, is_sub)
-        opens, closes, why = _ground_truth(rng, code, ts, outage)
+        opens, closes, why = _ground_truth(rng, code, ts, outage, width_rng)
 
         transactions.append({
             "transaction_id": "pay_%s%04d" % (format(seed, "x")[:3].upper(), i),
