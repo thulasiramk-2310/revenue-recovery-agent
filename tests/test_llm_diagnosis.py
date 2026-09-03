@@ -143,6 +143,52 @@ class TestFailsClosed(unittest.TestCase):
                 self.assertFalse(
                     Proposal(verdict=v, code="NETWORK_TIMEOUT").accepted)
 
+    def test_a_transport_that_raises_is_caught_not_propagated(self):
+        # Regression. propose() promises to ALWAYS return a Proposal; a
+        # transport that blows up is one more way of learning nothing, and
+        # learning nothing means UNKNOWN. Letting it escape would take down a
+        # whole batch run over a classification that was never load-bearing --
+        # fail-open behaviour in the one module built to fail closed.
+        def boom(prompt, key, model, timeout, max_tokens, provider):
+            raise RuntimeError("provider client exploded")
+
+        p = propose(MYSTERY, CODES, CONFIG, api_key="k", _transport=boom)
+        self.assertEqual(p.verdict, FAILED_TRANSPORT)
+        self.assertFalse(p.accepted)
+        self.assertIn("RuntimeError", p.error)
+
+    def test_a_typeerror_inside_a_transport_is_not_mistaken_for_wrong_arity(self):
+        # The specific bug this replaced. Arity used to be discovered by
+        # calling with six arguments and catching TypeError, which cannot tell
+        # "this takes five parameters" from "this has a bug". A real TypeError
+        # was swallowed, retried with the wrong arity, and re-raised with a
+        # misleading "missing 1 required positional argument" message that
+        # named the wrong problem entirely.
+        def buggy(prompt, key, model, timeout, max_tokens, provider):
+            raise TypeError("a real bug inside the transport")
+
+        p = propose(MYSTERY, CODES, CONFIG, api_key="k", _transport=buggy)
+        self.assertEqual(p.verdict, FAILED_TRANSPORT)
+        self.assertIn("a real bug inside the transport", p.error,
+                      "the original error must survive, not be replaced by an "
+                      "arity message about a different problem")
+
+    def test_both_transport_arities_are_dispatched_correctly(self):
+        # Five-argument transports predate provider routing and are still used
+        # across this file; six-argument ones get the provider. Both must
+        # work, and the choice is made from the signature, never by trying one
+        # and catching the failure.
+        five = propose(MYSTERY, CODES, CONFIG, api_key="k",
+                       _transport=transport(reply("ISSUER_DOWN")))
+        self.assertTrue(five.accepted)
+
+        seen = []
+        six = propose(MYSTERY, CODES, CONFIG, api_key="k",
+                      _transport=provider_transport(reply("ISSUER_DOWN"),
+                                                    seen=seen))
+        self.assertTrue(six.accepted)
+        self.assertEqual(seen, [CONFIG["provider"]])
+
     def test_disabled_in_policy_means_no_call_is_made(self):
         calls = []
 
