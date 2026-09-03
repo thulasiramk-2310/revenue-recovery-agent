@@ -50,6 +50,7 @@ No new dependency.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import time
@@ -167,6 +168,29 @@ def load_api_key(env_path=".env", provider="anthropic"):
                         k.strip(), v.strip().strip('"').strip("'"))
     env_name = "GROQ_API_KEY" if provider == "groq" else "ANTHROPIC_API_KEY"
     return (os.environ.get(env_name) or "").strip() or None
+
+
+def _accepts_provider(fn):
+    """Whether a transport takes the six-argument (provider-aware) form.
+
+    Asked of the SIGNATURE rather than discovered by calling and catching
+    TypeError. Catching it cannot tell "this callable has five parameters"
+    apart from "this callable has a bug that raised TypeError", and the
+    retry-on-TypeError version of this did the second one silently: a real
+    error inside a six-argument transport was swallowed, replaced with a
+    misleading arity message, and re-raised out of propose -- which would
+    crash a batch instead of degrading to UNKNOWN, in the one module whose
+    entire purpose is failing closed.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return True          # builtins and C callables: assume current form
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values()):
+        return True          # *args accepts either
+    return len([p for p in params.values()
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                              inspect.Parameter.POSITIONAL_OR_KEYWORD)]) >= 6
 
 
 def _extract_json(text):
@@ -314,16 +338,24 @@ def propose(failure_code, allowed_codes, config, gateway_message="",
                            bank=issuer_bank or "(unknown)")
 
     call = _transport or _call_api
+    timeout = float(cfg.get("timeout_seconds", 8))
+    max_tokens = int(cfg.get("max_output_tokens", 300))
+    args = ((prompt, key, model, timeout, max_tokens, provider)
+            if _accepts_provider(call)
+            else (prompt, key, model, timeout, max_tokens))
+
     started = time.time()
     try:
-        text, error = call(prompt, key, model, float(cfg.get("timeout_seconds", 8)),
-                           int(cfg.get("max_output_tokens", 300)), provider)
-    except TypeError:
-        # Backwards-compatible test seam: older fake transports accept the
-        # original five arguments. Real provider routing still goes through
-        # the six-argument call above.
-        text, error = call(prompt, key, model, float(cfg.get("timeout_seconds", 8)),
-                           int(cfg.get("max_output_tokens", 300)))
+        text, error = call(*args)
+    except Exception as e:
+        # The contract is that propose ALWAYS returns a Proposal. A transport
+        # that raises -- for any reason, including a bug of its own -- is one
+        # more way of learning nothing, and learning nothing means UNKNOWN.
+        # Letting it propagate would take down a whole batch run over a
+        # classification that was never load-bearing.
+        return result(FAILED_TRANSPORT,
+                      error="transport raised %s: %s" % (type(e).__name__, e),
+                      latency_ms=int((time.time() - started) * 1000))
     latency = int((time.time() - started) * 1000)
 
     if error:
