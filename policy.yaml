@@ -59,10 +59,23 @@ limits:
                                   # quota. Spacing is a compliance property of
                                   # the contact budget, not of the retry
                                   # cooldown, which protects the instrument.
-  batch_spend_ceiling_paise: 100000
-                                  # Rs 1,000 demo ceiling. The shipped run
-                                  # spends Rs 943.50, so the guard is active
-                                  # without truncating the reference batch.
+  batch_spend_ceiling_paise: 250000
+                                  # Rs 2,500. A runaway-spend breaker, not a
+                                  # budget. It must sit well ABOVE normal
+                                  # operation or it stops being a safety
+                                  # device and becomes a silent cap.
+                                  #
+                                  # At Rs 1,000 it was the latter: the seed-44
+                                  # batch spends Rs 943.50 and squeaked under,
+                                  # but seeds 42, 99 and 2026 all aborted
+                                  # mid-run at ~Rs 998, truncating the batch
+                                  # and changing every headline number. A
+                                  # breaker that fires on three of four normal
+                                  # runs is not catching anything.
+                                  #
+                                  # Raising it is free: seed 44 never reaches
+                                  # either ceiling, so the reference run is
+                                  # bit-identical at Rs 1,000 and Rs 2,500.
                                   # Set to 0/null to disable in experiments;
                                   # lower it deliberately to prove the abort.
   abort_batch_if_decline_rate_above: 0.85
