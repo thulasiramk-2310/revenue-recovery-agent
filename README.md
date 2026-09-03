@@ -11,15 +11,19 @@ reconstruct the entire run without the code.
 
 ## Four things worth your attention
 
-**1. The agent loses to a naive baseline on gross revenue, and that is the
-headline.** ₹85,228.95 against ₹98,475.41 — a ₹13,246.46 gap. It is stated
-first rather than buried, because a recovery number that only looks good
-next to a strawman is not a result. The analysis of *why* is the interesting
-part: **92.8% of that gap (₹12,296.20, 4 transactions) is money the
-compliance policy forbids the agent to touch** — `CARD_BLOCKED` fraud holds
-that the baseline blindly retries and sometimes wins. On the ground the two
-arms actually share, they are **0.96% apart**, with the agent spending 3.2×
-fewer attempts. See [section 1](#1-measured-money-recovered-across-a-batch).
+**1. On this data model, the recovery number is noise — and I can show it.**
+Across 8 seeds the agent lands anywhere from **₹53,758 ahead to ₹33,691
+behind**, winning outright on 2 of them. So the honest answer is that I
+*cannot* tell you bounding recovery costs money, and any single-batch figure
+here — including the shipped ₹85,228.95 against ₹98,475.41 — is one draw
+rather than a finding.
+
+**What *is* stable is the discipline.** Same 8 seeds: the agent spends
+**2.7–3.2× fewer attempts** (mean 3.0×), earns more per attempt in **8 of 8**
+(mean 3.6×), commits **zero** compliance breaches, and its audit chain
+verifies every time. That is a weaker claim than a recovery win and a much
+harder one to knock down. See
+[section 1](#1-measured-money-recovered-across-a-batch).
 
 **2. The efficiency argument is tested, not asserted.** "Fewer attempts" only
 matters if attempts cost something, so the report computes the price at which
@@ -104,9 +108,8 @@ succeeded* against ground truth. Every audit line carries `gateway_call`
   <img src="docs/ai-containment.svg" alt="Pipeline: detect to diagnose to policy to execute to audit. The LLM box connects only to diagnose, and the missing edge to policy is marked with a red cross." width="100%">
 </p>
 
-The animation traces the live path. The red cross marks the edge that **does
-not exist** — the model can change what a failure is *called*, and can never
-change what happens next.
+The red cross marks the edge that **does not exist**. The model can change
+what a failure is *called*; it can never change what happens next.
 
 The two things worth reading off this diagram are **where the model sits** and
 **where it does not reach**.
@@ -334,33 +337,50 @@ easiest thing in this repo to catch.
 
 ### How much of this is the seed?
 
-A fair question about any single synthetic batch, so here is the answer
-rather than an assurance. Same code, same policy, four seeds:
+A fair question about any single synthetic batch, so here is the answer rather
+than an assurance. Same code, same policy, eight seeds.
 
-| seed | agent gross | baseline gross | gap | capture vs ceiling |
-|---|---|---|---|---|
-| 42 | ₹31,441 | ₹65,132 | baseline +₹33,691 | 16.5% |
-| **44** (shipped) | **₹85,229** | **₹98,475** | **baseline +₹13,246** | **42.1%** |
-| 99 | ₹100,205 | ₹103,817 | baseline +₹3,612 | 37.8% |
-| 2026 | ₹111,910 | ₹73,465 | **agent +₹38,445** | 30.7% |
+**What is NOT stable — the recovery number, or even its sign:**
 
-**The absolute number is strongly seed-dependent — ₹31,441 to ₹111,910 — and
-the direction is not stable either.** The agent loses on gross in three of
-four seeds and wins outright on the fourth. Any single-batch figure from this
-project, including the headline one, should be read as one draw rather than a
-performance claim.
+| seed | agent gross | baseline gross | direction |
+|---|---|---|---|
+| 1 | ₹78,176 | ₹24,418 | **agent +₹53,758** |
+| 7 | ₹32,174 | ₹38,284 | baseline +₹6,110 |
+| 42 | ₹31,441 | ₹65,132 | baseline +₹33,691 |
+| **44** (shipped) | **₹85,229** | **₹98,475** | **baseline +₹13,246** |
+| 99 | ₹100,205 | ₹103,817 | baseline +₹3,612 |
+| 123 | ₹66,904 | ₹79,918 | baseline +₹13,015 |
+| 2026 | ₹111,910 | ₹73,465 | **agent +₹38,445** |
+| 31337 | ₹110,224 | ₹125,037 | baseline +₹14,813 |
 
-Two things are worth noting about which seed is shipped. Seed 44 was chosen in
-phase 1 for *coverage* — it exercises every planted phenomenon including the
-forgone-money `CARD_BLOCKED` case, which seed 42 happens to lack — and that
-choice was made and documented long before any comparison existed. It is also
-**not** the flattering option: seed 2026 would let this README claim the agent
-beats the baseline. It does not, because the seed was not picked for the
-result.
+The agent wins outright on 2 of 8 and the swing spans ₹87,000. **On this data
+model the direction of the gross comparison is noise.** Neither the shipped
+loss nor a headline win would be a real finding, and this README does not
+claim either.
 
-What is stable across seeds is the structural claim rather than the total: the
-agent spends roughly a third of the attempts and wastes none on transactions
-that ground truth says can never recover.
+**What IS stable — efficiency and compliance, every seed:**
+
+| property | across all 8 seeds |
+|---|---|
+| attempts vs baseline | **2.7× – 3.2× fewer** (mean 3.0×) |
+| ₹ recovered per attempt | **agent higher in 8 of 8** — 1.4× to 9.7×, mean 3.6× |
+| contacts outside 09:00–21:00 IST | **0** |
+| transactions over the contact quota | **0** |
+| worst rolling-24h messages to one person | **2**, exactly the cap, every seed |
+| audit chain verified | **8 of 8** |
+| batches aborted by the spend guard | **0** |
+
+That is the actual claim this project can support: **the recovery total is
+noisy, the discipline is not.** A bounded agent reliably spends a third of the
+attempts, earns several times more per attempt, and holds every stated bound —
+and whether that also recovers more gross depends on the draw.
+
+One note on which seed is shipped. Seed 44 was chosen in phase 1 for
+*coverage* — it exercises every planted phenomenon including the forgone-money
+`CARD_BLOCKED` case, which seed 42 lacks — and that choice was made and
+documented long before any comparison existed. It is also **not** the
+flattering option: seed 1 or 2026 would let this README claim the agent beats
+the baseline. It doesn't, because the seed was not picked for the result.
 
 ---
 
@@ -394,9 +414,9 @@ that runs the full loop and asserts both scheduled retries actually fire.
   <img src="docs/two-budgets.svg" alt="The escalation ladder splits into three paths: attempts, contacts, and neither. Two meters drain on different clocks, showing that exhausting attempts leaves contacts available." width="100%">
 </p>
 
-Watch the two meters: they drain on **different clocks**. When the attempt
-meter empties the contact meter is still full, which is the entire fix — a
-hard decline stops retrying and starts talking, instead of stopping dead.
+The two meters are the whole point: the attempt budget is spent while the
+contact budget is untouched. That is the fix — a hard decline stops retrying
+and starts talking, instead of stopping dead.
 
 Gateway attempts and customer contacts are separate resources with separate
 caps, and **exhausting one never spends or cancels the other**. Each rung
