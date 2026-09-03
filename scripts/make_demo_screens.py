@@ -171,6 +171,49 @@ def screen_stability(rows):
     return out
 
 
+def screen_forgone():
+    """The CARD_BLOCKED money the policy refuses, computed from ground truth.
+
+    NOT every CARD_BLOCKED exception -- only the ones ground truth says would
+    actually have cleared on retry. The full exception list is 14
+    transactions, but most of those are genuinely dead and no strategy
+    recovers them. Quoting the larger number would inflate the carve-out into
+    something it is not.
+    """
+    W = 68
+    import json
+    data = json.load(io.open(os.path.join("data", "failed_payments.json"),
+                             encoding="utf-8"))
+    txns = data["transactions"] if isinstance(data, dict) else data
+    hits = [t for t in txns
+            if t.get("failure_code") == "CARD_BLOCKED"
+            and (t.get("_ground_truth") or {}).get("is_recoverable")]
+    total = sum(t["amount_paise"] for t in hits)
+
+    out = ["=" * W,
+           "  MONEY THE POLICY FORBIDS ME TO TAKE",
+           "=" * W,
+           "  CARD_BLOCKED -- cards sitting on fraud holds.",
+           "  Ground truth says these WOULD have cleared on retry.",
+           "",
+           "  policy.yaml lists CARD_BLOCKED under stop_immediately_on,",
+           "  so the agent never touches them. The baseline retries",
+           "  blindly and collects.",
+           "",
+           "  %-24s %14s" % ("transaction", "amount"),
+           "  " + "-" * (W - 4)]
+    for t in sorted(hits, key=lambda x: -x["amount_paise"]):
+        out.append("  %-24s %14s"
+                   % (t["transaction_id"], rs(t["amount_paise"])))
+    out += ["  " + "-" * (W - 4),
+            "  %d transactions%s%s" % (len(hits), " " * 12, rs(total)),
+            "",
+            "  Not a shortfall. The compliance rule having a price --",
+            "  and the price is now a number I can show you.",
+            "=" * W]
+    return out
+
+
 def main():
     os.chdir(ROOT)
     print("\ncomputing 8 seeds (~40s, this is why it is not run mid-take):")
@@ -181,6 +224,8 @@ def main():
           "0:25  the turn -- direction is noise")
     _save("02_stability.txt", screen_stability(rows),
           "1:15  what IS stable -- strongest screen")
+    _save("03_forgone.txt", screen_forgone(),
+          "2:50  the money deliberately not taken")
 
     print("\nRUN LIVE ON CAMERA (real execution, fast enough to narrate over):")
     print("  python -m src.run_batch | Select-Object -Last %d" % TABLE_TAIL_LINES)
