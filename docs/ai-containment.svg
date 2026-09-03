@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 320" width="860" height="320" role="img" aria-label="Pipeline diagram: detect to diagnose to policy to execute to audit. The LLM box connects only to diagnose, never to policy.">
+  <title>Where the model sits, and where it does not reach</title>
+  <desc>The LLM proposes a diagnosis for unmapped failure codes only. It has no edge to policy.py, which is the only component that decides actions. Bounds come from policy.yaml.</desc>
+
+  <style>
+    .bg    { fill: #0d1117; }
+    .box   { fill: #161b22; stroke: #30363d; stroke-width: 1.5; rx: 8; }
+    .model { fill: #2e1065; stroke: #a78bfa; stroke-width: 2.5; }
+    .dec   { fill: #052e1f; stroke: #34d399; stroke-width: 2.5; }
+    .doc   { fill: #3b2506; stroke: #fbbf24; stroke-width: 2; }
+    .t     { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #e6edf3; }
+    .lbl   { font-size: 13px; font-weight: 600; }
+    .sub   { font-size: 10px; fill: #8b949e; }
+    .edge  { stroke: #484f58; stroke-width: 2; fill: none; marker-end: url(#a); }
+    .edgeM { stroke: #a78bfa; stroke-width: 2.5; fill: none; marker-end: url(#am); }
+    .edgeD { stroke: #fbbf24; stroke-width: 2; fill: none; stroke-dasharray: 5 4; marker-end: url(#ad); }
+    .no    { stroke: #f85149; stroke-width: 2.5; fill: none; stroke-dasharray: 7 6; opacity: .55; }
+
+    .flow  { stroke-dasharray: 7 11; animation: march 1.5s linear infinite; }
+    @keyframes march { to { stroke-dashoffset: -18; } }
+
+    .pulse { animation: glow 2.6s ease-in-out infinite; }
+    @keyframes glow {
+      0%, 100% { stroke-opacity: .55; }
+      50%      { stroke-opacity: 1; }
+    }
+
+    .xmark { animation: blink 2.6s ease-in-out infinite; }
+    @keyframes blink {
+      0%, 100% { opacity: .35; }
+      50%      { opacity: .9; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .flow, .pulse, .xmark { animation: none; }
+    }
+  </style>
+
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#484f58"/>
+    </marker>
+    <marker id="am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#a78bfa"/>
+    </marker>
+    <marker id="ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#fbbf24"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="860" height="320"/>
+
+  <!-- main pipeline -->
+  <g>
+    <rect class="box" x="24"  y="150" width="118" height="52"/>
+    <text class="t lbl" x="83"  y="172" text-anchor="middle">detect.py</text>
+    <text class="t sub" x="83"  y="188" text-anchor="middle">outage windows</text>
+
+    <rect class="box" x="212" y="150" width="126" height="52"/>
+    <text class="t lbl" x="275" y="172" text-anchor="middle">diagnose.py</text>
+    <text class="t sub" x="275" y="188" text-anchor="middle">WHAT happened</text>
+
+    <rect class="box dec pulse" x="408" y="144" width="140" height="64"/>
+    <text class="t lbl" x="478" y="168" text-anchor="middle">policy.py</text>
+    <text class="t sub" x="478" y="183" text-anchor="middle">decides EVERYTHING</text>
+    <text class="t sub" x="478" y="196" text-anchor="middle">6 ordered rules</text>
+
+    <rect class="box" x="618" y="150" width="112" height="52"/>
+    <text class="t lbl" x="674" y="172" text-anchor="middle">execute.py</text>
+    <text class="t sub" x="674" y="188" text-anchor="middle">acts</text>
+
+    <rect class="box" x="770" y="150" width="66" height="52"/>
+    <text class="t lbl" x="803" y="172" text-anchor="middle">audit</text>
+    <text class="t sub" x="803" y="188" text-anchor="middle">log</text>
+  </g>
+
+  <path class="edge flow" d="M142,176 L206,176"/>
+  <path class="edge flow" d="M338,176 L402,176"/>
+  <path class="edge flow" d="M548,176 L612,176"/>
+  <path class="edge flow" d="M730,176 L764,176"/>
+
+  <!-- the model -->
+  <g>
+    <rect class="box model pulse" x="196" y="30" width="160" height="66"/>
+    <text class="t lbl" x="276" y="52" text-anchor="middle" fill="#c4b5fd">llm_diagnose.py</text>
+    <text class="t sub" x="276" y="68" text-anchor="middle" fill="#a78bfa">proposes a diagnosis</text>
+    <text class="t sub" x="276" y="82" text-anchor="middle" fill="#a78bfa">unmapped codes only</text>
+  </g>
+  <path class="edgeM flow" d="M276,96 L276,144"/>
+
+  <!-- the edge that does not exist -->
+  <path class="no xmark" d="M356,63 L478,63 L478,140"/>
+  <g class="xmark">
+    <circle cx="470" cy="63" r="13" fill="#0d1117" stroke="#f85149" stroke-width="2.5"/>
+    <path d="M464,57 L476,69 M476,57 L464,69" stroke="#f85149" stroke-width="2.5" stroke-linecap="round"/>
+  </g>
+  <text class="t sub" x="392" y="50" fill="#f85149" font-weight="600">no edge from the model to policy</text>
+
+  <!-- policy.yaml -->
+  <rect class="box doc" x="398" y="252" width="160" height="46"/>
+  <text class="t lbl" x="478" y="272" text-anchor="middle" fill="#fcd34d">policy.yaml</text>
+  <text class="t sub" x="478" y="288" text-anchor="middle" fill="#d4a017">every limit and delay</text>
+  <path class="edgeD flow" d="M478,250 L478,212"/>
+
+  <text class="t sub" x="24" y="24" font-size="11">The model can change WHAT a failure is called. It can never change what happens next.</text>
+</svg>
