@@ -75,9 +75,9 @@
 
   <!-- the moment that matters -->
   <g class="callout">
-    <rect x="502" y="86" width="330" height="40" rx="6" fill="#1a1207" stroke="#d4a017" stroke-width="1.5"/>
-    <text class="t sub" x="516" y="102" fill="#fcd34d" font-weight="600">attempts exhausted — contacts still available</text>
-    <text class="t sub" x="516" y="117">a hard decline stops retrying and starts talking</text>
+    <rect x="502" y="86" width="330" height="40" rx="6" fill="#2a1d05" stroke="#fbbf24" stroke-width="2"/>
+    <text class="t" x="516" y="103" fill="#fde68a" font-size="11" font-weight="700">attempts exhausted — contacts still available</text>
+    <text class="t" x="516" y="118" fill="#d9c89a" font-size="10">a hard decline stops retrying and starts talking</text>
   </g>
 
   <!-- handoff -->
