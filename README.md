@@ -1,16 +1,46 @@
 # Payment Recovery Agent
 
-Razorpay AI Buildathon â€” **Track 3, AI Revenue Recovery**
+Razorpay AI Buildathon — **Track 3, AI Revenue Recovery**
 
 Takes a batch of failed payments, works out why each one failed, picks a
 bounded recovery action from a declarative policy, executes it against
 Razorpay test-mode APIs, and produces an audit trail complete enough to
 reconstruct the entire run without the code.
 
-**The headline result is that the agent recovers less gross revenue than a
-naive baseline.** That is reported first, explained in section 1, and not
-buried. 93% of the remaining gap is revenue our compliance policy forbids us
-from touching.
+---
+
+## Four things worth your attention
+
+**1. The agent loses to a naive baseline on gross revenue, and that is the
+headline.** ₹85,228.95 against ₹98,475.41 — a ₹13,246.46 gap. It is stated
+first rather than buried, because a recovery number that only looks good
+next to a strawman is not a result. The analysis of *why* is the interesting
+part: **92.8% of that gap (₹12,296.20, 4 transactions) is money the
+compliance policy forbids the agent to touch** — `CARD_BLOCKED` fraud holds
+that the baseline blindly retries and sometimes wins. On the ground the two
+arms actually share, they are **0.96% apart**, with the agent spending 3.2×
+fewer attempts. See [section 1](#1-measured-money-recovered-across-a-batch).
+
+**2. The efficiency argument is tested, not asserted.** "Fewer attempts" only
+matters if attempts cost something, so the report computes the price at which
+the bounded approach would actually win: **₹28.56 per attempt, 11× the ₹2.50
+assumed.** That is far above real Indian PG economics, which means the
+efficiency case does **not** carry this result. Printing the number that
+undercuts your own argument is the point.
+
+**3. The recovery-window model was pre-registered before it was changed.**
+Phase 1's windows were implausibly wide, which flattered blind retrying. The
+corrected widths, a per-code justification, and the invariants that must
+*not* move were written to [`WINDOW_MODEL.md`](WINDOW_MODEL.md) and committed
+as `2537a81` **before** the generator was touched. The git ordering is the
+evidence that the correction was not tuning. A recorded prediction is in that
+file, and the result is reported against it either way.
+
+**4. The audit trail is a test, not a viewer.** `replay.py` rebuilds a run
+from `results/run.log` alone and **recomputes** the totals from the logged
+prices rather than reading back the run's own claim — reading the claim back
+would verify nothing. It has caught the run being wrong **four times**, and
+every time the run was wrong rather than the replay.
 
 ---
 
@@ -28,69 +58,13 @@ python -m src.replay --compare       # rebuild the run from its log alone
 python -m unittest discover -s tests # 149 tests
 ```
 
-No API keys needed for any of that â€” the default is a dry run that touches no
+No API keys needed for any of that — the default is a dry run that touches no
 network. To make real calls against Razorpay **test mode**:
 
 ```bash
 cp .env.example .env                 # add your rzp_test_ keys
 python -m src.run_batch --live --limit 25
 ```
-
----
-
-## Where the AI is used
-
-The core recovery policy is deliberately deterministic. That is the safety
-choice: an LLM should not be able to decide to retry a blocked card, raise an
-attempt limit, contact a customer outside permitted hours, or spend past the
-batch ceiling.
-
-AI is used at the diagnosis boundary, where it is valuable and bounded:
-
-1. Known gateway failure codes use the hand-written taxonomy in
-   `src/diagnose.py`.
-2. Unknown gateway failure codes go to `src/llm_diagnose.py`.
-3. The model may return only one existing taxonomy code, or `UNSURE`.
-4. The model never chooses the action. `policy.yaml` and `src/policy.py`
-   still decide retry, hold, customer contact, handoff, or stop.
-5. Every accepted or rejected proposal is logged with model, prompt version,
-   confidence, raw response, and verdict.
-6. If the model is wrong, slow, offline, malformed, or missing credentials,
-   the system falls back to the conservative `UNKNOWN` policy.
-
-The fastest way to show this to judges is:
-
-```bash
-python -m src.run_ai_demo
-```
-
-That command uses an offline deterministic model fixture by default, so it is
-repeatable and needs no API key. It creates an unmapped code,
-`ISSUER_UNAVAILABLE_TRY_LATER`, maps it to the existing `ISSUER_DOWN`
-diagnosis, applies an already-detected issuer degradation signal, and shows
-the policy choosing `HOLD`. Use `--live-llm` only if you deliberately want to
-call the configured model.
-
-To use a real LLM call for that demo:
-
-```bash
-cp .env.example .env
-# add GROQ_API_KEY to .env
-python -m src.run_ai_demo --live-llm
-```
-
-The batch runner uses the same LLM path when it sees an unmapped code in the
-input batch. The standard generated batch mostly uses known codes, so
-`run_ai_demo` is the clean way to make the AI path visible without changing
-the benchmark.
-
-`policy.yaml` defaults this live path to Groq
-(`provider: groq`, `model: llama-3.3-70b-versatile`) through Groq's
-OpenAI-compatible chat completions API. Anthropic is still supported by
-changing the provider/model and setting `ANTHROPIC_API_KEY`.
-
-The point to say out loud: **the LLM diagnoses uncertainty; the policy moves
-money.**
 
 ---
 
@@ -102,7 +76,7 @@ Read this before the numbers.
 |---|---|
 | Failed-payment batch | **Synthetic.** 240 generated transactions with planted ground truth. |
 | Order creation | **Real.** `POST /v1/orders` against test mode; order ids fetch back from the API. |
-| Authorisation outcome | **Simulated** against ground truth â€” see below. |
+| Authorisation outcome | **Simulated** against ground truth — see below. |
 | Customer messages | **Stubbed. Nothing is ever sent.** Full payload logged, marked `delivered: false`. |
 
 Razorpay exposes no server-side way to drive a card authorisation with an
@@ -231,8 +205,8 @@ that kind of failure*; the rule path records which was which.
 
 ## 1. Measured money recovered across a batch
 
-240 transactions worth â‚¹542,522.78. Recoverable ceiling â€” straight from
-`would_recover_if_retried_at` â€” is **112 transactions / â‚¹202,447.60**, 37.3%
+240 transactions worth ₹542,522.78. Recoverable ceiling — straight from
+`would_recover_if_retried_at` — is **112 transactions / ₹202,447.60**, 37.3%
 of batch value. Every rate below is against that ceiling, not against the
 batch total, because the batch total includes money nobody could ever get.
 
@@ -250,24 +224,24 @@ batch total, because the batch total includes money nobody could ever get.
   Capture vs ceiling                  42.1%            48.6%
 ```
 
-Costed at â‚¹2.50 per gateway attempt and â‚¹1.00 per message â€” assumptions, not
+Costed at ₹2.50 per gateway attempt and ₹1.00 per message — assumptions, not
 measurements, and overridable. Cost follows **messages sent**, not people
 reached: 406 messages to 104 customers costs 406 sends, and charging per
 customer would silently discount every follow-up. Both columns appear because
-they measure different things â€” sends drive the rupee cost, reach drives the
+they measure different things — sends drive the rupee cost, reach drives the
 goodwill cost, and the goodwill cost is deliberately **not** monetised rather
 than given an invented figure.
 
-**The agent loses on gross by â‚¹13,246.46 and on net by â‚¹12,457.46.** Costing
-attempts does not rescue it: an attempt would have to cost â‚¹28.56 â€” 11Ã— the
-assumption, far above real Indian PG economics â€” for the efficiency argument
+**The agent loses on gross by ₹13,246.46 and on net by ₹12,457.46.** Costing
+attempts does not rescue it: an attempt would have to cost ₹28.56 — 11× the
+assumption, far above real Indian PG economics — for the efficiency argument
 to carry the result.
 
-The contact rungs recover **â‚¹0**, and that is a property of the data, not a
+The contact rungs recover **₹0**, and that is a property of the data, not a
 finding about dunning. Ground truth models recovery as a function of retry
 *timing* only; a customer receiving an email and updating their card is not
-something this batch represents. Contacts are therefore pure cost here â€”
-â‚¹406 of the agent's â‚¹943.50 â€” and the honest reading is that this
+something this batch represents. Contacts are therefore pure cost here —
+₹406 of the agent's ₹943.50 — and the honest reading is that this
 measurement can show escalation is *compliant and bounded*, not that it
 *works*.
 
@@ -275,23 +249,23 @@ measurement can show escalation is *compliant and bounded*, not that it
 
 | | |
 |---|---|
-| Gross gap | â‚¹13,246.46 |
-| â€¦of which the baseline collects from transactions our policy forbids us to retry | **â‚¹12,296.20 â€” 92.8%** |
-| **Like-for-like gap** | **â‚¹950.26** |
+| Gross gap | ₹13,246.46 |
+| …of which the baseline collects from transactions our policy forbids us to retry | **₹12,296.20 — 92.8%** |
+| **Like-for-like gap** | **₹950.26** |
 
 On the ground the two arms actually share, they are within **0.96%** of each
-other â€” and the agent gets there with **3.2Ã— fewer attempts**. See section 5.
+other — and the agent gets there with **3.2× fewer attempts**. See section 5.
 
 ### Method
 
 Both arms are scored by the same function (`execute.resolve_outcome`) against
 the same ground-truth windows on the same batch. Neither marks its own
 homework. An attempt succeeds only if it lands inside
-`[would_recover_if_retried_at, recovery_window_closes_at]` â€” money arrives,
+`[would_recover_if_retried_at, recovery_window_closes_at]` — money arrives,
 then gets spent, so retry *timing* matters and not merely retry *count*.
 
 The baseline is verified blind: it spends the full 3 attempts on every hard
-decline (`nÃ—3` exactly for all four terminal codes â€” 384 attempts across 128
+decline (`n×3` exactly for all four terminal codes — 384 attempts across 128
 unrecoverable transactions, recovering none). Five tests fail if anyone makes
 it smarter, because a baseline that quietly diagnoses would be using the
 knowledge the agent is credited for.
@@ -305,14 +279,14 @@ succeeds, timing cannot matter and a blind sprayer is optimal by
 construction. On those windows the baseline captured 86.0% of the ceiling
 against the agent's 51.4%.
 
-Correcting this makes the agent look better, which is exactly the problem â€” a
+Correcting this makes the agent look better, which is exactly the problem — a
 correction that helps its author is indistinguishable from tuning. So the new
 widths and a per-code justification were **written and committed before the
 generator was touched or anything was re-measured**:
 [`WINDOW_MODEL.md`](WINDOW_MODEL.md), commit `2537a81`. The git ordering is
 the evidence.
 
-Three widths were narrowed on grounds of how the condition behaves â€” a
+Three widths were narrowed on grounds of how the condition behaves — a
 transport timeout resolves in minutes, an issuer outage bounds its own
 window, a balance failure recovers at a credit event rather than over five
 days. Two were held: `DO_NOT_HONOR` stays wide because issuer discretion
@@ -321,32 +295,32 @@ never retries it, so its width only affects how much the *baseline* collects.
 
 Isolating the change took care. `random.randint` consumes a variable number
 of bits depending on its range, so editing a range desynchronised the shared
-stream and changed the batch itself â€” the ceiling moved from 112 to 94
+stream and changed the batch itself — the ceiling moved from 112 to 94
 transactions. Window widths are now drawn from a separate stream, and the
 corrected batch is bit-identical to phase 1 in every respect except width.
 
 ### Sensitivity: the operating range
 
 One comparison at one width is a point estimate dressed as a finding. The
-curve is the honest version â€” `python -m src.sensitivity`:
+curve is the honest version — `python -m src.sensitivity`:
 
 | median width | agent | baseline | gross gap | agent n | base n | like-for-like |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.9h | â‚¹32,235 | â‚¹35,808 | â‚¹3,573 | 233 | 717 | base +3,573 |
-| 1.8h | â‚¹32,534 | â‚¹41,444 | â‚¹8,910 | 233 | 716 | base +6,111 |
-| 4.5h | â‚¹43,781 | â‚¹65,152 | â‚¹21,371 | 228 | 698 | base +11,574 |
-| 9.0h | â‚¹73,915 | â‚¹90,453 | â‚¹16,539 | 219 | 695 | base +4,242 |
-| **18.0h** | **â‚¹85,229** | **â‚¹98,475** | **â‚¹13,246** | **215** | **693** | **base +950** |
-| 36.0h | â‚¹86,886 | â‚¹109,805 | â‚¹22,919 | 215 | 675 | base +10,623 |
-| 72.0h | â‚¹96,702 | â‚¹127,073 | â‚¹30,371 | 213 | 639 | base +18,075 |
-| 144.0h | â‚¹100,141 | â‚¹169,578 | â‚¹69,436 | 213 | 620 | base +57,140 |
-| 576.0h | â‚¹100,721 | â‚¹174,022 | â‚¹73,301 | 213 | 611 | base +61,004 |
+| 0.9h | ₹32,235 | ₹35,808 | ₹3,573 | 233 | 717 | base +3,573 |
+| 1.8h | ₹32,534 | ₹41,444 | ₹8,910 | 233 | 716 | base +6,111 |
+| 4.5h | ₹43,781 | ₹65,152 | ₹21,371 | 228 | 698 | base +11,574 |
+| 9.0h | ₹73,915 | ₹90,453 | ₹16,539 | 219 | 695 | base +4,242 |
+| **18.0h** | **₹85,229** | **₹98,475** | **₹13,246** | **215** | **693** | **base +950** |
+| 36.0h | ₹86,886 | ₹109,805 | ₹22,919 | 215 | 675 | base +10,623 |
+| 72.0h | ₹96,702 | ₹127,073 | ₹30,371 | 213 | 639 | base +18,075 |
+| 144.0h | ₹100,141 | ₹169,578 | ₹69,436 | 213 | 620 | base +57,140 |
+| 576.0h | ₹100,721 | ₹174,022 | ₹73,301 | 213 | 611 | base +61,004 |
 
 **There is no crossover. The agent loses at every width, on gross, on net and
 like-for-like.** It comes closest at the shipped 18h width, within 0.96%.
 
 The shape is the interesting part. As windows widen, the baseline's advantage
-grows without limit while the agent's recovery plateaus around â‚¹100k â€” extra
+grows without limit while the agent's recovery plateaus around ₹100k — extra
 duration rewards extra attempts, and the agent is capped at ~215 by design.
 Below ~2h both collapse: the opportunity is too short for anyone to hit
 reliably, and the baseline's volume still wins on raw coverage.
@@ -357,6 +331,36 @@ An unbounded sprayer that ignores fraud holds and burns 384 attempts on dead
 accounts is not something a payments company would deploy, but it does
 recover more money on this batch, and pretending otherwise would be the
 easiest thing in this repo to catch.
+
+### How much of this is the seed?
+
+A fair question about any single synthetic batch, so here is the answer
+rather than an assurance. Same code, same policy, four seeds:
+
+| seed | agent gross | baseline gross | gap | capture vs ceiling |
+|---|---|---|---|---|
+| 42 | ₹31,441 | ₹65,132 | baseline +₹33,691 | 16.5% |
+| **44** (shipped) | **₹85,229** | **₹98,475** | **baseline +₹13,246** | **42.1%** |
+| 99 | ₹100,205 | ₹103,817 | baseline +₹3,612 | 37.8% |
+| 2026 | ₹111,910 | ₹73,465 | **agent +₹38,445** | 30.7% |
+
+**The absolute number is strongly seed-dependent — ₹31,441 to ₹111,910 — and
+the direction is not stable either.** The agent loses on gross in three of
+four seeds and wins outright on the fourth. Any single-batch figure from this
+project, including the headline one, should be read as one draw rather than a
+performance claim.
+
+Two things are worth noting about which seed is shipped. Seed 44 was chosen in
+phase 1 for *coverage* — it exercises every planted phenomenon including the
+forgone-money `CARD_BLOCKED` case, which seed 42 happens to lack — and that
+choice was made and documented long before any comparison existed. It is also
+**not** the flattering option: seed 2026 would let this README claim the agent
+beats the baseline. It does not, because the seed was not picked for the
+result.
+
+What is stable across seeds is the structural claim rather than the total: the
+agent spends roughly a third of the attempts and wastes none on transactions
+that ground truth says can never recover.
 
 ---
 
@@ -381,7 +385,7 @@ agent gives up rather than escalating past the ladder's end.
 Rung 1 requires `attempts_remaining`, which is what lets it repeat until the
 allowance is spent. An earlier version advanced the rung after *every*
 attempt, making that predicate dead code and giving each transaction exactly
-one retry â€” worth â‚¹28,923 of recoverable money. Fixed, with a regression test
+one retry — worth ₹28,923 of recoverable money. Fixed, with a regression test
 that runs the full loop and asserts both scheduled retries actually fire.
 
 ### Two budgets, not one
@@ -410,14 +414,14 @@ declares which it spends:
 ```
 
 This was originally wrong, and wrong in a way that flattered the agent.
-Stopping rules 2 and 3 returned STOP and ended the transaction, so rungs 3â€“5
+Stopping rules 2 and 3 returned STOP and ended the transaction, so rungs 3–5
 were unreachable: the run made **zero customer contacts**, three of five rungs
 were dead code while `policy.yaml` advertised them, and
 `Customers contacted: 0` sat in the cost table reading like restraint when it
 was a bug.
 
 Rules 2 and 3 now **foreclose retries** rather than ending the transaction. A
-hard decline closes the gateway, not the customer â€” an expired card is
+hard decline closes the gateway, not the customer — an expired card is
 precisely the case where asking the customer to act is the only thing that can
 work. Rules 3b, 4 and 5 exist solely to protect the attempt budget, so they are
 skipped once retries are foreclosed; control always reaches the ladder, which
@@ -451,8 +455,8 @@ Two further rules turned out to be advertised but never fired, both found only
 once contacts became reachable:
 
 - **Rung 4 never sent.** Rung 3 repeated, spent the whole contact budget on two
-  identical notices, and `request_instrument_update` â€” the message that
-  actually asks for a new card â€” never went out. Fixed by `repeatable` above.
+  identical notices, and `request_instrument_update` — the message that
+  actually asks for a new card — never went out. Fixed by `repeatable` above.
 - **`max_attempts_per_customer_per_day` had never once fired**, since phase 1.
   `TransactionState` carried the field and no caller ever populated it, so every
   transaction was decided as though its customer had a clean slate.
@@ -462,13 +466,13 @@ Turning contacts on also exposed a limit that did not exist: the
 per-transaction quota is not a limit on what a **person** receives. A customer
 with five failed payments collected ten messages while every transaction stayed
 individually compliant, so `max_contacts_per_customer_per_24h` bounds the
-person, not the payment. It is a **rolling** 24h window â€” measured by calendar
+person, not the payment. It is a **rolling** 24h window — measured by calendar
 day it let 20 message pairs through by straddling midnight, and one customer
 received three messages inside 24 hours with every individual day under the
 limit.
 
 Measured on the run's own audit log: 406 messages, **zero** outside
-09:00â€“21:00 IST, **zero** transactions over the 2-message quota, **zero** pairs
+09:00–21:00 IST, **zero** transactions over the 2-message quota, **zero** pairs
 closer than the 24h spacing rule, and a worst case of exactly **2** messages to
 any one customer in any rolling 24h window. Across the full 30-day batch the
 most any customer received was 10, spread over 5 separate failed payments.
@@ -531,7 +535,7 @@ compliance:
 ```
 
 A per-code `cooldown_override_minutes` exists because the 6h default made
-`NETWORK_TIMEOUT`'s `[2, 15, 90]` minute backoff unreachable â€” the schedule
+`NETWORK_TIMEOUT`'s `[2, 15, 90]` minute backoff unreachable — the schedule
 in the document was not the schedule that ran, and 40 retries were being
 silently re-timed. Overrides require a stated rationale, and a test asserts
 every configured delay is actually reachable.
@@ -539,7 +543,7 @@ every configured delay is actually reachable.
 ### The unmapped-code default
 
 A failure code the taxonomy has never seen routes to `unmapped_code_fallback:
-UNKNOWN` â€” one retry at +360 minutes under `max_attempts_override: 2`, then
+UNKNOWN` — one retry at +360 minutes under `max_attempts_override: 2`, then
 human review. The delay is deliberately set *at* the default cooldown rather
 than given an override:
 
@@ -554,11 +558,11 @@ than given an override:
 
 Worth being precise about the provenance of that rule, because it is about to
 carry more weight than it was built for. It was written in phase 2, to settle
-an argument about the cooldown override â€” long before any LLM was planned,
+an argument about the cooldown override — long before any LLM was planned,
 and with no knowledge of what it would later need to protect. When a model is
 wired in to classify unfamiliar gateway messages, **every** way that can fail
-â€” unmapped code, malformed output, API error, deadline overrun, missing
-credentials â€” lands here. A conservative default that was argued for on its
+— unmapped code, malformed output, API error, deadline overrun, missing
+credentials — lands here. A conservative default that was argued for on its
 own merits, before the hole it now plugs existed, is a great deal harder to
 attack than one written to plug it.
 
@@ -571,7 +575,7 @@ attack than one written to plug it.
 `results/run.log` is append-only JSONL, hash-chained: each entry commits to
 the previous one, so an edited, inserted or deleted line is detectable.
 
-A policy decision â€” note `policy_rule_applied` is a real path into
+A policy decision — note `policy_rule_applied` is a real path into
 `policy.yaml`, so any call can be re-derived without reading code:
 
 ```json
@@ -613,8 +617,8 @@ python -m src.replay --compare                    # rebuild and diff
 python -m src.replay --transaction pay_2C0011     # one payment's full story
 ```
 
-`replay.py` rebuilds a complete run **from the log alone** â€” not the batch,
-not `policy.yaml`, not the run's own summary â€” recomputes every total
+`replay.py` rebuilds a complete run **from the log alone** — not the batch,
+not `policy.yaml`, not the run's own summary — recomputes every total
 including net recovery from the logged cost assumptions, and diffs its
 reconstruction against what the run claimed at the time. Gaps are reported,
 never filled in from elsewhere.
@@ -633,16 +637,72 @@ holds and *would* clear on retry. `policy.yaml` lists `CARD_BLOCKED` in
 `stop_immediately_on`, so the agent never touches them. The blind baseline
 retries them and collects the money.
 
-**4 transactions. â‚¹12,296.20. 92.8% of the entire gross gap.**
+**4 transactions. ₹12,296.20. 92.8% of the entire gross gap.**
 
 The baseline "beats" us almost entirely by retrying transactions our policy
 classifies as fraud holds. We consider that the product working. A recovery
 agent that improves its numbers by hammering blocked cards is not a better
-agent â€” it is one that has quietly reclassified a compliance rule as a
+agent — it is one that has quietly reclassified a compliance rule as a
 tuning parameter.
 
 It is listed first in `results/exceptions.md`, under "knowingly forgone",
 because it is what a reviewer should push on hardest.
+
+---
+
+## Where the AI is used
+
+The core recovery policy is deliberately deterministic. That is the safety
+choice: an LLM should not be able to decide to retry a blocked card, raise an
+attempt limit, contact a customer outside permitted hours, or spend past the
+batch ceiling.
+
+AI is used at the diagnosis boundary, where it is valuable and bounded:
+
+1. Known gateway failure codes use the hand-written taxonomy in
+   `src/diagnose.py`.
+2. Unknown gateway failure codes go to `src/llm_diagnose.py`.
+3. The model may return only one existing taxonomy code, or `UNSURE`.
+4. The model never chooses the action. `policy.yaml` and `src/policy.py`
+   still decide retry, hold, customer contact, handoff, or stop.
+5. Every accepted or rejected proposal is logged with model, prompt version,
+   confidence, raw response, and verdict.
+6. If the model is wrong, slow, offline, malformed, or missing credentials,
+   the system falls back to the conservative `UNKNOWN` policy.
+
+The fastest way to show this to judges is:
+
+```bash
+python -m src.run_ai_demo
+```
+
+That command uses an offline deterministic model fixture by default, so it is
+repeatable and needs no API key. It creates an unmapped code,
+`ISSUER_UNAVAILABLE_TRY_LATER`, maps it to the existing `ISSUER_DOWN`
+diagnosis, applies an already-detected issuer degradation signal, and shows
+the policy choosing `HOLD`. Use `--live-llm` only if you deliberately want to
+call the configured model.
+
+To use a real LLM call for that demo:
+
+```bash
+cp .env.example .env
+# add GROQ_API_KEY to .env
+python -m src.run_ai_demo --live-llm
+```
+
+The batch runner uses the same LLM path when it sees an unmapped code in the
+input batch. The standard generated batch mostly uses known codes, so
+`run_ai_demo` is the clean way to make the AI path visible without changing
+the benchmark.
+
+`policy.yaml` defaults this live path to Groq
+(`provider: groq`, `model: llama-3.3-70b-versatile`) through Groq's
+OpenAI-compatible chat completions API. Anthropic is still supported by
+changing the provider/model and setting `ANTHROPIC_API_KEY`.
+
+The point to say out loud: **the LLM diagnoses uncertainty; the policy moves
+money.**
 
 ---
 
@@ -662,6 +722,125 @@ Nothing is aggregated away, and the uncomfortable bucket is first.
 
 ---
 
+## What broke, and how I found it
+
+Five real failures from development, worst first. The detection mechanism is
+the part worth reading: **three of the five were caught by tooling built for
+another purpose**, not by noticing.
+
+### 1. A fail-open path inside the module built to fail closed
+
+Provider routing supported two transport signatures by calling with six
+arguments and catching `TypeError` to fall back to five. That conflates *"this
+callable takes five parameters"* with *"this callable has a bug"*. When a real
+error occurred inside a six-argument transport, it was swallowed, the call
+retried at the wrong arity, and what surfaced was
+`missing 1 required positional argument: 'provider'` — the original error
+destroyed and replaced by a message naming a different problem entirely.
+
+Worse, it escaped `propose()`, which promises to *always* return a `Proposal`
+so that any failure degrades to UNKNOWN. A provider-side bug would have killed
+a whole batch run instead. Fail-open, in the one module whose entire purpose
+is failing closed.
+
+**Caught by:** writing the architecture doc. I went to verify a row in a
+failure-mode table rather than trust my own prose, and the claim did not hold.
+**Fixed by:** reading arity from the signature with `inspect`, plus a
+catch-all that turns any transport exception into `FAILED_TRANSPORT` with the
+original message preserved.
+**Lesson:** never discover a property by triggering an error that has more
+than one possible cause.
+
+### 2. Four policy rules that were advertised and never fired
+
+`policy.yaml` documented an escalation ladder, a per-customer daily attempt
+cap, and contact quotas. Four of those did nothing. Rungs 3–5 were unreachable
+behind a terminal STOP, so the run made **zero customer contacts** and three
+of five rungs were dead code. Rung 4 was starved by rung 3 repeating.
+`max_attempts_per_customer_per_day` had never fired since phase 1 because
+`TransactionState` carried the field and no caller ever populated it. And no
+per-*person* contact limit existed at all — one customer could collect ten
+messages while every transaction stayed individually compliant.
+
+All four failed silently and in a way that looked like discipline.
+`Customers contacted: 0` sat in the cost table reading like restraint.
+
+**Caught by:** a reviewer asking why the contacts column was zero. This one
+was *not* caught by tooling, which is exactly why it survived longest.
+**Lesson:** a config value nothing asserts on is a claim, not a rule.
+
+### 3. Correcting one input silently changed another
+
+`random.randint` consumes a variable number of bits depending on its range, so
+editing a recovery-window width desynchronised the shared RNG stream and
+changed the batch itself — the recoverable ceiling moved 112 → 94 and total
+batch value shifted about ₹57,000. Two things would have changed at once and
+the before/after comparison would have meant nothing.
+
+**Caught by:** invariants recorded in [`WINDOW_MODEL.md`](WINDOW_MODEL.md)
+*before* the change, specifically the line stating the ceiling must stay 112
+transactions / ₹202,447.60. Without that pre-registration this would have
+looked like a successful correction.
+**Fixed by:** a separate RNG stream for widths plus stream-preserving
+discarded draws in the main one. The corrected batch is identical to the
+original in every respect except width.
+**Lesson:** when measuring a change, prove the thing you did *not* change did
+not move.
+
+### 4. A test that pinned the bug in place
+
+`_climb_ladder` skipped any rung with `step <= escalation_step` while
+`_work_transaction` advanced the step after every attempt, so rung 1 could
+fire exactly once and the `attempts_remaining` predicate was dead code. Every
+transaction got a single retry regardless of its configured schedule — worth
+₹28,923 of recoverable money.
+
+The suite was green. `test_ladder_never_skips_an_eligible_rung` asserted
+`assertGreater` on consecutive rungs, which *encodes strict advance* — the
+bug itself, written down as the expected behaviour.
+
+**Caught by:** re-reading the policy semantics against the test, after the
+recovered total looked lower than the schedules in `policy.yaml` implied.
+**Lesson:** a passing test proves consistency with what was written down, not
+correctness. Assertions deserve the same scrutiny as the code.
+
+### 5. Replay caught the run being wrong, four times
+
+`replay.py` rebuilds a run from its log alone and recomputes the totals rather
+than reading back the run's own claim. Four times it disagreed with the
+summary, and **four times the run was the wrong one**: final-status counting
+versus per-attempt counting; policy-layer and executor-layer decisions sharing
+verb names (57 contacts produced 114 `escalated` lines); the baseline computed
+after the log closed so it could not be rebuilt; and cost charged per unique
+customer rather than per message sent, understating spend by ₹45.
+
+Individually these are minor — the last is a ₹45 arithmetic slip. Collectively
+they are the reason the audit trail is worth anything.
+
+**Caught by:** `python -m src.replay --compare`, every time, automatically.
+**Lesson:** an audit trail that only ever agrees with its own producer is not
+verifying anything. Recompute; don't read back.
+
+### The pattern underneath four of these
+
+**A documented guard that never executes in the default path.** It has now
+appeared four times: the dead ladder rungs, the unpopulated per-customer cap,
+`limits.cooldown_hours` silently overriding retry schedules that were shorter
+than it, and — found while writing the architecture doc — the decline-rate
+circuit breaker, which is armed only in live mode (`enforce_decline_breaker
+=live`) and therefore never fires in the default dry run.
+
+That last one is defensible: in a dry run, outcomes come from ground truth, so
+a "decline rate" is not a real gateway signal. But it is documented as a
+safety device, and a safety device that does nothing in the configuration
+everybody actually runs deserves saying out loud rather than discovering.
+
+The habit that now catches these is asking, of every documented limit,
+*"show me the line where this fires"* — and if the answer is a config value
+with no assertion behind it, writing the assertion.
+
+---
+
 ## Limitations
 
 Blunt, because overclaiming is the fastest way to lose a panel round.
@@ -669,9 +848,9 @@ Blunt, because overclaiming is the fastest way to lose a panel round.
 **The agent loses to the naive baseline on gross revenue.** At every window
 width tested, on gross, on net, and like-for-like. The best case is a 0.96%
 deficit. The case for it rests on attempt efficiency, compliance, and zero
-wasted attempts â€” not on recovering more money. Adding the contact rungs made
-this slightly worse, not better: they cost â‚¹406 and recovered nothing, moving
-the net deficit from â‚¹12,051.46 to â‚¹12,457.46. That is reported rather than
+wasted attempts — not on recovering more money. Adding the contact rungs made
+this slightly worse, not better: they cost ₹406 and recovered nothing, moving
+the net deficit from ₹12,051.46 to ₹12,457.46. That is reported rather than
 suppressed, because a correctness fix that costs money is still a correctness
 fix.
 
@@ -690,8 +869,8 @@ would have succeeded is read from planted ground truth. The agent has never
 actually recovered a rupee.
 
 **Escalation is bounded and compliant, but not shown to work.** The contact
-rungs now run â€” 406 messages across 104 customers, every compliance rail
-verified against the audit log â€” and they recover **â‚¹0**. Ground truth models
+rungs now run — 406 messages across 104 customers, every compliance rail
+verified against the audit log — and they recover **₹0**. Ground truth models
 recovery purely as a function of retry *timing*, so a customer updating their
 card after an email is not something this batch can represent. Contacts are
 pure cost in this measurement. Everything here demonstrates that escalation is
@@ -705,7 +884,7 @@ real resource, not an exact simulation of concurrent dunning across a live
 queue.
 
 **Issuer degradation detection is scored against outages this repo planted
-itself.** Recall 0.872 Â± 0.118 across 20 seeds is a real measurement of the
+itself.** Recall 0.872 ± 0.118 across 20 seeds is a real measurement of the
 detector against a known answer, not evidence it would find a real HDFC
 outage.
 
@@ -715,9 +894,9 @@ refunds, multi-currency, chargebacks, per-merchant policy overrides,
 concurrency or idempotency under parallel workers, and any real PII handling
 or data-retention policy.
 
-**Costs are assumptions.** â‚¹2.50 per attempt and â‚¹1.00 per contact are
-plausible, not measured, and the indirect cost of a rising decline ratio â€”
-which is the strongest real argument for retrying less â€” is not quantified
+**Costs are assumptions.** ₹2.50 per attempt and ₹1.00 per contact are
+plausible, not measured, and the indirect cost of a rising decline ratio —
+which is the strongest real argument for retrying less — is not quantified
 anywhere.
 
 ---
