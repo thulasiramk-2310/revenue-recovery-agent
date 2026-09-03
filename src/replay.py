@@ -56,6 +56,7 @@ FINAL_STATUS_FROM_DECISION = {
     "retry_executed": "failed",
     "escalated": "contact_stubbed",
     "retry_suppressed": "suppressed_already_paid",
+    "batch_aborted": "batch_aborted",
 }
 FINAL_STATUS_FROM_EVENT = {
     "execution_skipped": "not_attempted",
@@ -90,6 +91,7 @@ def rebuild(log_path=DEFAULT_LOG):
     detections, diagnoses = [], {}
     decisions, executions = {}, {}
     contacts, gateway_calls, backoffs, reconciles = [], [], [], []
+    aborts = []
     logged_summary = None
     timeline = []
     gaps = []
@@ -127,6 +129,8 @@ def rebuild(log_path=DEFAULT_LOG):
         elif e.get("decision"):
             # A decision line. The policy layer and the execution layer both
             # write these; the execution ones carry an outcome_source.
+            if e.get("decision") == "batch_aborted":
+                aborts.append(e)
             if e.get("outcome_source") or e.get("attempted_at"):
                 executions.setdefault(tid, []).append(e)
                 mapped = FINAL_STATUS_FROM_DECISION.get(e["decision"])
@@ -189,6 +193,13 @@ def rebuild(log_path=DEFAULT_LOG):
         gaps.append("%d executions do not state whether their outcome came "
                     "from the gateway or from simulation" % len(unexplained))
 
+    attempts_spent = (exec_status.get("retry_executed", 0)
+                      + exec_status.get("recovered", 0))
+    batch_spend_paise = (
+        attempts_spent * costs["per_attempt_paise"]
+        + len(contacts) * costs["per_contact_paise"]
+    ) if costs else None
+
     return {
         "log_path": log_path,
         "chain": chain,
@@ -206,6 +217,11 @@ def rebuild(log_path=DEFAULT_LOG):
         },
         "rebuilt_summary": {
             "batch_size": len(decisions),
+            "input_batch_size": run_context.get("batch_size"),
+            "sliced": bool(run_context.get("sliced")),
+            "batch_aborted": bool(aborts),
+            "batch_abort_rule": aborts[-1].get("policy_rule_applied") if aborts else None,
+            "batch_abort_reason": aborts[-1].get("reason") if aborts else None,
             "total_value_paise": total_value,
             "detections": len(detections),
             "actions": dict(actions),
@@ -219,8 +235,8 @@ def rebuild(log_path=DEFAULT_LOG):
             "customers_contacted": _customers(contacts),
             # Gateway attempts the agent spent, rebuilt by counting the
             # execution lines rather than trusting a reported total.
-            "attempts_spent": (exec_status.get("retry_executed", 0)
-                               + exec_status.get("recovered", 0)),
+            "attempts_spent": attempts_spent,
+            "batch_spend_paise": batch_spend_paise,
             "costs": costs,
             # Net is RECOMPUTED from the rebuilt attempt and contact counts
             # using the logged prices -- not copied from the run's claim.

@@ -29,6 +29,7 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from baseline.fixed_retry import FIXED_SCHEDULE_HOURS, run_baseline
 
@@ -87,9 +88,104 @@ def _ground_truth_index(path="data/failed_payments.json"):
     through load_batch(), which strips this, and only the executor's outcome
     resolution ever sees it.
     """
-    data = json.loads(open(path, encoding="utf-8").read())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     return {t["transaction_id"]: t.get("_ground_truth", {})
             for t in data["transactions"]}
+
+
+class RunGuard:
+    """Batch-level spend and decline-rate controls.
+
+    Policy decides what is allowed for one transaction. This guard owns the
+    shared resources that only make sense at batch scope: total run spend and
+    whether live retry outcomes are bad enough to halt the queue.
+    """
+
+    def __init__(self, policy, log, attempt_cost_paise, contact_cost_paise,
+                 enforce_decline_breaker=False):
+        self.policy = policy
+        self.log = log
+        self.attempt_cost_paise = int(attempt_cost_paise)
+        self.contact_cost_paise = int(contact_cost_paise)
+        self.enforce_decline_breaker = bool(enforce_decline_breaker)
+        self.spend_paise = 0
+        self.retry_attempts = 0
+        self.retry_declines = 0
+        self.aborted = False
+        self.abort_reason = None
+        self.abort_rule = None
+
+    def cost_for(self, consumes):
+        if consumes == "attempt":
+            return self.attempt_cost_paise
+        if consumes == "contact":
+            return self.contact_cost_paise
+        return 0
+
+    def before_execute(self, transaction, decision):
+        ceiling = self.policy.limits.get("batch_spend_ceiling_paise")
+        next_cost = self.cost_for(getattr(decision, "consumes", None))
+        if ceiling is None or int(ceiling) <= 0 or next_cost <= 0:
+            return True
+        if self.spend_paise + next_cost <= int(ceiling):
+            return True
+        self.abort(
+            transaction,
+            "limits.batch_spend_ceiling_paise",
+            "Executing %s would take batch spend from Rs %.2f to Rs %.2f, "
+            "above the configured ceiling of Rs %.2f."
+            % (
+                getattr(decision, "action", None),
+                self.spend_paise / 100.0,
+                (self.spend_paise + next_cost) / 100.0,
+                int(ceiling) / 100.0,
+            ),
+        )
+        return False
+
+    def after_execute(self, transaction, decision, result):
+        consumes = getattr(decision, "consumes", None)
+        self.spend_paise += self.cost_for(consumes)
+        if consumes != "attempt":
+            return
+        self.retry_attempts += 1
+        if not result.get("recovered"):
+            self.retry_declines += 1
+        if not self.enforce_decline_breaker or self.retry_attempts == 0:
+            return
+        decline_rate = self.retry_declines / float(self.retry_attempts)
+        abort, rule = self.policy.should_abort_batch(decline_rate)
+        if abort:
+            self.abort(
+                transaction,
+                rule,
+                "Live retry decline rate is %.1f%% after %d attempts, above "
+                "the configured breaker."
+                % (decline_rate * 100.0, self.retry_attempts),
+            )
+
+    def abort(self, transaction, rule, reason):
+        if self.aborted:
+            return
+        self.aborted = True
+        self.abort_rule = rule
+        self.abort_reason = reason
+        self.log.decision(
+            transaction_id=transaction["transaction_id"],
+            decision="batch_aborted",
+            reason=reason,
+            policy_rule_applied=rule,
+            amount_paise=transaction.get("amount_paise"),
+            failure_code=transaction.get("failure_code"),
+            issuer_bank=transaction.get("issuer_bank"),
+            action="batch_abort",
+            outcome_source="policy",
+            gateway_call="none",
+            attempted_at=transaction.get("timestamp"),
+            batch_spend_paise=self.spend_paise,
+            retry_attempts=self.retry_attempts,
+            retry_declines=self.retry_declines,
+        )
 
 
 class CustomerLedger:
@@ -155,7 +251,7 @@ class CustomerLedger:
 
 
 def _work_transaction(policy, log, executor, transaction, diagnosis, signals,
-                      horizon, ledger=None):
+                      horizon, ledger=None, guard=None):
     """Work one transaction the way an agent actually would: as a queue item.
 
     The clock starts when the payment failed and advances only as the policy
@@ -216,8 +312,24 @@ def _work_transaction(policy, log, executor, transaction, diagnosis, signals,
                 break
             now = d.scheduled_time
 
+        if guard is not None and not guard.before_execute(work, d):
+            last_result = {
+                "status": "batch_aborted",
+                "action": d.action,
+                "attempted_at": now,
+                "gateway_call": "none",
+                "outcome_source": "policy",
+                "recovered": False,
+                "note": guard.abort_reason,
+            }
+            break
+
         last_result = executor.attempt(work, d)
+        if guard is not None:
+            guard.after_execute(work, d, last_result)
         if last_result.get("recovered"):
+            break
+        if guard is not None and guard.aborted:
             break
 
         # The budget was spent. Charge it to the RIGHT one and let the policy
@@ -250,7 +362,9 @@ def _work_transaction(policy, log, executor, transaction, diagnosis, signals,
 
 def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
         limit=None, horizon=DEFAULT_HORIZON, data_path="data/failed_payments.json",
-        policy_path="policy.yaml", quiet=False):
+        policy_path="policy.yaml", quiet=False,
+        cost_per_attempt_paise=COST_PER_ATTEMPT_PAISE,
+        cost_per_contact_paise=COST_PER_CONTACT_PAISE):
     # data/ is gitignored, so this is the FIRST thing a fresh clone hits if
     # the quickstart's generate_data step is skipped. A traceback here reads
     # as a broken project; it is just a missing input, and the fix is one
@@ -279,6 +393,7 @@ def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
                       "data_file": data_path,
                       "data_seed": meta.get("seed"),
                       "batch_size": len(txns),
+                      "sliced": bool(limit),
                       "horizon": horizon,
                       "mode": "live_test_api" if live else "dry_run",
                   }) as log:
@@ -287,7 +402,7 @@ def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
                             ground_truth=ground_truth)
         log.event("run_configured", mode="live_test_api" if live else "dry_run",
                   key_id=mask(executor.key_id) if live else None,
-                  batch_size=len(txns), horizon=horizon,
+                  batch_size=len(txns), sliced=bool(limit), horizon=horizon,
                   gateway_semantics=(
                       "orders are created for real against test mode; the "
                       "authorisation outcome is resolved from ground truth "
@@ -295,26 +410,47 @@ def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
                       "drive an authorisation"
                   ) if live else "no network calls")
 
-        diagnoses, signals = diagnose_batch(txns, audit=log)
+        diagnoses, signals = diagnose_batch(
+        txns, audit=log, llm_config=policy.doc.get("llm_diagnosis"))
 
         results, decisions = {}, {}
+        processed_txns = []
         ledger = CustomerLedger()
+        guard = RunGuard(
+            policy, log, cost_per_attempt_paise, cost_per_contact_paise,
+            enforce_decline_breaker=live,
+        )
         for t in txns:
             tid = t["transaction_id"]
             final_decision, final_result = _work_transaction(
                 policy, log, executor, t, diagnoses[tid], signals, horizon,
-                ledger=ledger,
+                ledger=ledger, guard=guard,
             )
+            processed_txns.append(t)
             decisions[tid] = final_decision
             results[tid] = final_result
+            if guard.aborted:
+                log.event(
+                    "batch_abort_acknowledged",
+                    reason=guard.abort_reason,
+                    policy_rule_applied=guard.abort_rule,
+                    processed_transactions=len(processed_txns),
+                    remaining_transactions=len(txns) - len(processed_txns),
+                )
+                break
 
         recovered_paise = sum(
-            t["amount_paise"] for t in txns
+            t["amount_paise"] for t in processed_txns
             if results[t["transaction_id"]].get("recovered")
         )
         summary = {
-            "batch_size": len(txns),
-            "total_value_paise": sum(t["amount_paise"] for t in txns),
+            "batch_size": len(processed_txns),
+            "input_batch_size": len(txns),
+            "sliced": bool(limit),
+            "batch_aborted": guard.aborted,
+            "batch_abort_rule": guard.abort_rule,
+            "batch_abort_reason": guard.abort_reason,
+            "total_value_paise": sum(t["amount_paise"] for t in processed_txns),
             "detections": len(signals),
             "actions": dict(collections.Counter(d.action for d in decisions.values())),
             # Two views of the same run, both needed: where each transaction
@@ -332,6 +468,7 @@ def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
             "reconciles": executor.stats["reconciles"],
             "attempts_spent": executor.stats["attempts"],
             "customers_contacted": len(executor.customers_contacted),
+            "batch_spend_paise": guard.spend_paise,
             "mode": "live_test_api" if live else "dry_run",
         }
 
@@ -344,16 +481,16 @@ def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
         # the log closed left replay.py unable to rebuild it, and a number in
         # the summary that the log cannot reproduce is exactly the gap the
         # replay exists to catch.
-        base = run_baseline(txns, ground_truth)
-        ceiling = _ceiling(txns, ground_truth)
+        base = run_baseline(processed_txns, ground_truth)
+        ceiling = _ceiling(processed_txns, ground_truth)
         summary["baseline"] = {k: v for k, v in base.items()
                                if k not in ("per_transaction", "recovered_ids")}
         summary["ceiling"] = {k: v for k, v in ceiling.items() if k != "ids"}
         summary["uplift_paise"] = (summary["recovered_paise"]
                                    - base["recovered_paise"])
         summary["costs"] = {
-            "per_attempt_paise": COST_PER_ATTEMPT_PAISE,
-            "per_contact_paise": COST_PER_CONTACT_PAISE,
+            "per_attempt_paise": int(cost_per_attempt_paise),
+            "per_contact_paise": int(cost_per_contact_paise),
         }
         # Cost is driven by MESSAGES SENT, not by people reached. 133 sends
         # across 88 customers costs 133 sends. Charging per unique customer
@@ -363,10 +500,10 @@ def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
         # measure of the goodwill cost that is deliberately NOT monetised.
         summary["net_recovered_paise"] = _net(
             summary["recovered_paise"], summary["attempts_spent"],
-            summary["contacts_stubbed"])
+            summary["contacts_stubbed"], summary["costs"])
         summary["baseline"]["net_recovered_paise"] = _net(
             base["recovered_paise"], base["attempts_spent"],
-            base["contacts_sent"])
+            base["contacts_sent"], summary["costs"])
         # The prices belong in the trail. A net figure is unreadable without
         # them, and a reviewer must be able to substitute their own and
         # recompute rather than take ours on faith.
@@ -384,22 +521,26 @@ def run(log_path=DEFAULT_LOG, summary_path=DEFAULT_SUMMARY, live=False,
 
     exceptions_path = os.path.join(
         os.path.dirname(log_path) or ".", "exceptions.md")
-    write_exceptions(exceptions_path, txns, decisions, results, diagnoses,
+    write_exceptions(exceptions_path, processed_txns, decisions, results, diagnoses,
                      ground_truth, base)
 
     if not quiet:
-        _report(summary, chain, signals, outages, diagnoses, txns, live)
-        _comparison(summary, base, ceiling, txns, ground_truth, results)
+        _report(summary, chain, signals, outages, diagnoses, processed_txns, live)
+        _comparison(summary, base, ceiling, processed_txns, ground_truth, results)
         print("\n  exception list written to %s" % exceptions_path)
 
     return summary
 
 
-def _net(recovered_paise, attempts, contacts):
+def _net(recovered_paise, attempts, contacts, costs=None):
     """Recovered rupees minus what it cost to go and get them."""
+    costs = costs or {
+        "per_attempt_paise": COST_PER_ATTEMPT_PAISE,
+        "per_contact_paise": COST_PER_CONTACT_PAISE,
+    }
     return (recovered_paise
-            - attempts * COST_PER_ATTEMPT_PAISE
-            - contacts * COST_PER_CONTACT_PAISE)
+            - attempts * int(costs["per_attempt_paise"])
+            - contacts * int(costs["per_contact_paise"]))
 
 
 def _break_even_attempt_cost_paise(summary, base):
@@ -417,7 +558,9 @@ def _break_even_attempt_cost_paise(summary, base):
     contact_gap = summary["contacts_stubbed"] - base["contacts_sent"]
     if gross_gap <= 0 or attempt_gap <= 0:
         return None
-    return (gross_gap + contact_gap * COST_PER_CONTACT_PAISE) / attempt_gap
+    contact_cost = int(summary.get("costs", {}).get(
+        "per_contact_paise", COST_PER_CONTACT_PAISE))
+    return (gross_gap + contact_gap * contact_cost) / attempt_gap
 
 
 def _ceiling(txns, ground_truth):
@@ -506,12 +649,20 @@ def main(argv=None):
     ap.add_argument("--log", default=DEFAULT_LOG)
     ap.add_argument("--summary", default=DEFAULT_SUMMARY)
     ap.add_argument("--horizon", default=DEFAULT_HORIZON)
+    ap.add_argument("--cost-per-attempt-paise", type=int,
+                    default=COST_PER_ATTEMPT_PAISE,
+                    help="direct cost assigned to one gateway retry")
+    ap.add_argument("--cost-per-contact-paise", type=int,
+                    default=COST_PER_CONTACT_PAISE,
+                    help="direct cost assigned to one customer message")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
     try:
         s = run(log_path=args.log, summary_path=args.summary, live=args.live,
-                limit=args.limit, horizon=args.horizon, quiet=args.quiet)
+                limit=args.limit, horizon=args.horizon, quiet=args.quiet,
+                cost_per_attempt_paise=args.cost_per_attempt_paise,
+                cost_per_contact_paise=args.cost_per_contact_paise)
     except LiveKeyRefused as e:
         sys.stderr.write("REFUSED: %s\n" % e)
         return 2
@@ -538,6 +689,10 @@ def _comparison(summary, base, ceiling, txns, ground_truth, results):
     b_net = summary["baseline"]["net_recovered_paise"]
     a_cost, b_cost = a_gross - a_net, b_gross - b_net
     cap = ceiling["paise"]
+    attempt_cost = int(summary.get("costs", {}).get(
+        "per_attempt_paise", COST_PER_ATTEMPT_PAISE))
+    contact_cost = int(summary.get("costs", {}).get(
+        "per_contact_paise", COST_PER_CONTACT_PAISE))
 
     print("\n" + "=" * 72)
     print("  AGENT vs FIXED-RETRY BASELINE")
@@ -563,7 +718,7 @@ def _comparison(summary, base, ceiling, txns, ground_truth, results):
     print("  recoverable ceiling      %d txns / %s (%s of batch value)"
           % (ceiling["count"], rup(cap), pct(cap, summary["total_value_paise"])))
     print("  costed at                %s per attempt, %s per contact"
-          % (rup(COST_PER_ATTEMPT_PAISE), rup(COST_PER_CONTACT_PAISE)))
+          % (rup(attempt_cost), rup(contact_cost)))
     print("                           (assumptions, not measurements; goodwill")
     print("                           cost of a contact is NOT monetised)")
 
@@ -586,7 +741,7 @@ def _comparison(summary, base, ceiling, txns, ground_truth, results):
         print("\nBREAK-EVEN   an attempt would have to cost %s for the agent"
               % rup(be))
         print("               to win on net. That is %.0fx the %s assumed here,"
-              % (be / COST_PER_ATTEMPT_PAISE, rup(COST_PER_ATTEMPT_PAISE)))
+              % (be / attempt_cost if attempt_cost else 0, rup(attempt_cost)))
         print("               and far above real Indian PG economics. The")
         print("               efficiency argument does not carry the result.")
 

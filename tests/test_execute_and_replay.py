@@ -33,6 +33,7 @@ from src.execute import (
 from src.policy import Decision, load_policy
 from src.diagnose import diagnose
 from src.run_batch import DEFAULT_HORIZON, _work_transaction
+from src.run_batch import RunGuard
 from src.replay import rebuild, story
 
 POLICY_PATH = os.path.join(
@@ -357,6 +358,37 @@ class TestRetryAllowanceIsFullyUsed(unittest.TestCase):
         self.assertTrue(all(s == 1 for s in seq),
                         "silent_retry should stay on rung 1 for the whole "
                         "allowance, got rungs %s" % seq)
+
+
+class TestBatchRuntimeGuards(unittest.TestCase):
+    """Controls that only exist once the whole batch shares a budget."""
+
+    def test_spend_ceiling_aborts_before_the_next_paid_action(self):
+        policy = load_policy(POLICY_PATH)
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        try:
+            with audit_mod.AuditLog(path, dry_run=True) as log:
+                ex = Executor(audit=log, policy=policy)
+                guard = RunGuard(
+                    policy, log, attempt_cost_paise=250,
+                    contact_cost_paise=100,
+                )
+                policy.limits["batch_spend_ceiling_paise"] = 1
+                final_decision, final_result = _work_transaction(
+                    policy, log, ex, TXN, diagnose(TXN), [], DEFAULT_HORIZON,
+                    guard=guard,
+                )
+            self.assertTrue(guard.aborted)
+            self.assertEqual(final_result["status"], "batch_aborted")
+            self.assertEqual(ex.stats["attempts"], 0)
+            rows = [e for e in audit_mod.read_entries(path)
+                    if e.get("decision") == "batch_aborted"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["policy_rule_applied"],
+                             "limits.batch_spend_ceiling_paise")
+        finally:
+            os.unlink(path)
 
 
 

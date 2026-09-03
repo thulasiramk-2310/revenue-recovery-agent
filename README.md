@@ -23,8 +23,9 @@ pip install -r requirements.txt
 
 python -m src.generate_data          # build the 240-transaction batch
 python -m src.run_batch              # run agent + baseline, print the table
+python -m src.run_ai_demo            # show the bounded AI diagnosis path
 python -m src.replay --compare       # rebuild the run from its log alone
-python -m unittest discover -s tests # 113 tests
+python -m unittest discover -s tests # 142 tests
 ```
 
 No API keys needed for any of that — the default is a dry run that touches no
@@ -34,6 +35,62 @@ network. To make real calls against Razorpay **test mode**:
 cp .env.example .env                 # add your rzp_test_ keys
 python -m src.run_batch --live --limit 25
 ```
+
+---
+
+## Where the AI is used
+
+The core recovery policy is deliberately deterministic. That is the safety
+choice: an LLM should not be able to decide to retry a blocked card, raise an
+attempt limit, contact a customer outside permitted hours, or spend past the
+batch ceiling.
+
+AI is used at the diagnosis boundary, where it is valuable and bounded:
+
+1. Known gateway failure codes use the hand-written taxonomy in
+   `src/diagnose.py`.
+2. Unknown gateway failure codes go to `src/llm_diagnose.py`.
+3. The model may return only one existing taxonomy code, or `UNSURE`.
+4. The model never chooses the action. `policy.yaml` and `src/policy.py`
+   still decide retry, hold, customer contact, handoff, or stop.
+5. Every accepted or rejected proposal is logged with model, prompt version,
+   confidence, raw response, and verdict.
+6. If the model is wrong, slow, offline, malformed, or missing credentials,
+   the system falls back to the conservative `UNKNOWN` policy.
+
+The fastest way to show this to judges is:
+
+```bash
+python -m src.run_ai_demo
+```
+
+That command uses an offline deterministic model fixture by default, so it is
+repeatable and needs no API key. It creates an unmapped code,
+`ISSUER_UNAVAILABLE_TRY_LATER`, maps it to the existing `ISSUER_DOWN`
+diagnosis, applies an already-detected issuer degradation signal, and shows
+the policy choosing `HOLD`. Use `--live-llm` only if you deliberately want to
+call the configured model.
+
+To use a real LLM call for that demo:
+
+```bash
+cp .env.example .env
+# add GROQ_API_KEY to .env
+python -m src.run_ai_demo --live-llm
+```
+
+The batch runner uses the same LLM path when it sees an unmapped code in the
+input batch. The standard generated batch mostly uses known codes, so
+`run_ai_demo` is the clean way to make the AI path visible without changing
+the benchmark.
+
+`policy.yaml` defaults this live path to Groq
+(`provider: groq`, `model: llama-3.3-70b-versatile`) through Groq's
+OpenAI-compatible chat completions API. Anthropic is still supported by
+changing the provider/model and setting `ANTHROPIC_API_KEY`.
+
+The point to say out loud: **the LLM diagnoses uncertainty; the policy moves
+money.**
 
 ---
 

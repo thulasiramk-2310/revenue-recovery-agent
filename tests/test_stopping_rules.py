@@ -883,12 +883,40 @@ class TestComplianceRails(PolicyCase):
         d = self.decide(txn(failure_code="INSUFFICIENT_FUNDS"), state, now=later(24))
         self.assertFalse(d.customer_visible and d.action not in (DEFER, STOP))
 
+    def test_consent_requirement_can_be_disabled_by_policy(self):
+        import copy
+        doc = copy.deepcopy(self.policy.doc)
+        doc["compliance"]["require_consent_for_contact"] = False
+        p = Policy(doc)
+        state = TransactionState(escalation_step=2, consent_on_file=False)
+        t = txn(failure_code="CARD_EXPIRED")
+        d = p.decide(t, diagnose(t), state, [], later(48))
+        self.assertTrue(d.customer_visible)
+        self.assertEqual(d.consumes, "contact")
+
     def test_contact_quota_is_respected(self):
         cap = self.policy.limits["max_customer_contacts_per_transaction"]
         state = TransactionState(escalation_step=2, contacts_used=cap,
                                  consent_on_file=True)
         d = self.decide(txn(failure_code="INSUFFICIENT_FUNDS"), state, now=later(24))
         self.assertNotEqual(d.audit_decision, "escalated")
+
+    def test_quiet_day_blocks_customer_contact(self):
+        import copy
+        quiet = "2026-08-12"
+        doc = copy.deepcopy(self.policy.doc)
+        doc["compliance"]["quiet_days"] = [quiet]
+        p = Policy(doc)
+        state = TransactionState(escalation_step=2, consent_on_file=True)
+        t = txn(failure_code="CARD_EXPIRED")
+        d = p.decide(t, diagnose(t), state, [],
+                     "2026-08-12T11:00:00+05:30")
+        self.assertEqual(d.action, DEFER)
+        self.assertIn("within_contact_hours", d.policy_rule_applied)
+        self.assertEqual(
+            datetime.fromisoformat(d.scheduled_time).astimezone(IST).date().isoformat(),
+            "2026-08-13",
+        )
 
     def test_subscription_retry_respects_pre_debit_notification(self):
         sub = self.policy.compliance["subscription_rules"]

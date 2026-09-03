@@ -190,8 +190,14 @@ def _parse(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
 
 
-def diagnose(transaction, batch_signals=None):
+def diagnose(transaction, batch_signals=None, resolved=None):
     """Characterise one failure. Pure: no I/O, no mutation of the input.
+
+    `resolved` is an optional {failure_code: Proposal} map from
+    src/llm_diagnose. It is passed IN rather than fetched here on purpose:
+    this function is pure and must stay that way, because the stopping rules
+    are tested against it in isolation. The network call happens in
+    diagnose_batch, which already owns the audit log.
 
     `batch_signals` is the list returned by detect_issuer_degradation. When a
     transaction falls inside a degradation window the diagnosis is REWRITTEN,
@@ -202,6 +208,18 @@ def diagnose(transaction, batch_signals=None):
     code = transaction.get("failure_code")
     base = FAILURE_TAXONOMY.get(code, UNKNOWN_DIAGNOSIS)
 
+    # An accepted LLM proposal maps an unmapped code onto a taxonomy entry.
+    # It can only ever apply where `base` is UNKNOWN_DIAGNOSIS: a code the
+    # taxonomy knows is never sent to a model, so a proposal cannot override
+    # or soften something the project already understands.
+    proposal = (resolved or {}).get(code)
+    llm_applied = False
+    if (proposal is not None and proposal.accepted
+            and code not in FAILURE_TAXONOMY
+            and proposal.code in FAILURE_TAXONOMY):
+        base = FAILURE_TAXONOMY[proposal.code]
+        llm_applied = True
+
     d = dict(base)
     d["failure_code"] = code
     d["transaction_id"] = transaction.get("transaction_id")
@@ -209,6 +227,20 @@ def diagnose(transaction, batch_signals=None):
     d["known_code"] = code in FAILURE_TAXONOMY
     d["confidence"] = 0.9 if d["known_code"] else 0.3
     d["evidence"] = ["failure_code=" + str(code)]
+
+    if llm_applied:
+        # Never silently inherit the mapped code's confidence. The diagnosis
+        # is now a model's opinion about an unfamiliar code, and the trail has
+        # to say so on the transaction, not only on the proposal line.
+        d["llm_proposed_code"] = proposal.code
+        d["llm_confidence"] = round(float(proposal.confidence), 4)
+        d["llm_model"] = proposal.model
+        d["llm_prompt_version"] = proposal.prompt_version
+        d["confidence"] = round(0.9 * float(proposal.confidence), 4)
+        d["evidence"].append(
+            "llm_diagnosis:%s -> %s (confidence %.2f, %s/%s)"
+            % (code, proposal.code, proposal.confidence,
+               proposal.model, proposal.prompt_version))
     d["batch_signal"] = None
     d["issuer_degraded"] = False
 
@@ -255,20 +287,35 @@ def diagnose(transaction, batch_signals=None):
     return d
 
 
-def diagnose_batch(transactions, audit=None, **detect_kwargs):
+def diagnose_batch(transactions, audit=None, llm_config=None,
+                   env_path=".env", llm_api_key=None, _llm_transport=None,
+                   **detect_kwargs):
     """Run both levels: batch degradation first, then every transaction.
 
     Order matters. Batch signals must exist before any per-transaction
     diagnosis, because a transaction inside an outage window gets a materially
     different diagnosis from an identical one outside it.
 
+    This is also where the LLM call lives, if one happens at all. `diagnose`
+    itself stays pure; the I/O is hoisted here, where the audit log already
+    is. Codes are resolved once each rather than once per transaction, so a
+    batch asks a question per unknown CODE, not per payment.
+
     Returns (diagnoses_by_transaction_id, batch_signals).
     """
     signals = detect_issuer_degradation(transactions, audit=audit, **detect_kwargs)
 
+    resolved = {}
+    if llm_config and llm_config.get("enabled"):
+        from .llm_diagnose import resolve_unmapped
+        resolved = resolve_unmapped(
+            transactions, set(FAILURE_TAXONOMY), llm_config, audit=audit,
+            env_path=env_path, api_key=llm_api_key, _transport=_llm_transport,
+        )
+
     diagnoses = {}
     for t in transactions:
-        d = diagnose(t, signals)
+        d = diagnose(t, signals, resolved=resolved)
         diagnoses[t["transaction_id"]] = d
         if audit is not None:
             # Logged BEFORE any decision consumes it, so the trail records
@@ -287,6 +334,8 @@ def diagnose_batch(transactions, audit=None, **detect_kwargs):
                 issuer_degraded=d["issuer_degraded"],
                 confidence=d["confidence"],
                 evidence=d["evidence"],
+                llm_proposed_code=d.get("llm_proposed_code"),
+                llm_prompt_version=d.get("llm_prompt_version"),
             )
 
     return diagnoses, signals

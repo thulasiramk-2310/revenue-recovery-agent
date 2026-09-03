@@ -265,6 +265,8 @@ def _p_within_contact_hours(ctx):
 
 
 def _p_consent_on_file(ctx):
+    if not ctx.get("require_consent_for_contact", True):
+        return True, "compliance.require_consent_for_contact=false"
     return bool(ctx["state"].consent_on_file), "state.consent_on_file"
 
 
@@ -314,22 +316,35 @@ class Policy:
 
     # -- helpers ---------------------------------------------------------
 
-    def _window_for(self, code):
+    def _window_for(self, code, proposed=None):
         """The retry_windows entry for a code, or the document's fallback.
 
         Which entry catches an unmapped code is itself a policy question, so
         the answer lives in policy.yaml (`unmapped_code_fallback`) rather than
         as a literal here. That keeps this module free of failure codes, which
         tests/test_stopping_rules.py enforces by scanning the source.
+
+        `proposed` is an accepted LLM classification for a code the taxonomy
+        does not have. Selecting a window by it is still the policy deciding:
+        the model says WHAT the failure is, and this document says what to do
+        about that kind of failure. The delay, the attempt allowance and every
+        bound continue to come from here.
+
+        It only ever applies where `code` itself is unmapped, so the worst
+        case is a different choice between entries the policy already wrote --
+        never a new entry, and never an override of a code a human mapped.
         """
         if code in self.retry_windows:
             return self.retry_windows[code], "retry_windows.%s" % code
+        if proposed and proposed in self.retry_windows:
+            return (self.retry_windows[proposed],
+                    "retry_windows.%s[llm_proposed]" % proposed)
         if self.fallback_code and self.fallback_code in self.retry_windows:
             return (self.retry_windows[self.fallback_code],
                     "retry_windows.%s" % self.fallback_code)
         return {}, "retry_windows.<no fallback configured>"
 
-    def effective_max_attempts(self, code, is_subscription):
+    def effective_max_attempts(self, code, is_subscription, proposed=None):
         """Tightest applicable attempt cap, and which rule set it.
 
         Every candidate is a ceiling; the smallest wins. Nothing may raise the
@@ -338,7 +353,7 @@ class Policy:
         """
         candidates = [(int(self.limits.get("max_attempts", 1)), "limits.max_attempts")]
 
-        window, wpath = self._window_for(code)
+        window, wpath = self._window_for(code, proposed=proposed)
         if "max_attempts_override" in window:
             candidates.append(
                 (int(window["max_attempts_override"]), wpath + ".max_attempts_override")
@@ -359,7 +374,7 @@ class Policy:
         value, rule = min(candidates, key=lambda c: c[0])
         return value, rule
 
-    def cooldown_for(self, code):
+    def cooldown_for(self, code, proposed=None):
         """Minimum gap between attempts for this code, and the rule that set it.
 
         The global default protects a customer's instrument from repeated
@@ -367,8 +382,21 @@ class Policy:
         gives a reason -- a reconcile-and-settle after an ambiguous timeout is
         not a dunning attempt and should not be paced like one. The override
         can only touch the gap: max_attempts stays absolute.
+
+        A COOLDOWN OVERRIDE IS NEVER REACHABLE THROUGH AN LLM PROPOSAL. Each
+        override was granted to one specific code with a written rationale --
+        NETWORK_TIMEOUT gets two minutes because settling an ambiguous
+        authorisation quickly is better for the customer than waiting six
+        hours to find out whether they were already charged. That reasoning
+        was about a code a human had identified. Letting a classifier reach
+        it would hand the model the fastest retry path in the document on the
+        strength of its own guess, so a proposed window keeps the safe
+        default gap and only its schedule and allowance apply.
         """
-        window, wpath = self._window_for(code)
+        window, wpath = self._window_for(code, proposed=proposed)
+        if proposed and code not in self.retry_windows:
+            return (timedelta(hours=float(self.limits.get("cooldown_hours", 0))),
+                    "limits.cooldown_hours[llm_proposed_keeps_default]")
         if "cooldown_override_minutes" in window:
             return (timedelta(minutes=float(window["cooldown_override_minutes"])),
                     wpath + ".cooldown_override_minutes")
@@ -384,7 +412,15 @@ class Policy:
         end = datetime.combine(local.date(), _hhmm(ch["end"]), tzinfo=IST)
         return start, end
 
+    def is_quiet_day(self, dt) -> bool:
+        """True when policy forbids customer contact on this IST date."""
+        quiet = self.compliance.get("quiet_days") or []
+        local_day = dt.astimezone(IST).date().isoformat()
+        return local_day in {str(day) for day in quiet}
+
     def within_contact_hours(self, dt) -> bool:
+        if self.is_quiet_day(dt):
+            return False
         start, end = self._contact_window(dt)
         if start is None:
             return True
@@ -396,12 +432,21 @@ class Policy:
         if start is None:
             return dt
         local = dt.astimezone(IST)
+        while self.is_quiet_day(local):
+            local = datetime.combine(
+                local.date() + timedelta(days=1),
+                _hhmm(self.compliance["contact_hours_ist"]["start"]),
+                tzinfo=IST,
+            )
+            start, end = self._contact_window(local)
         if local < start:
             return start
         if local > end:
             nxt = local.date() + timedelta(days=1)
             ch = self.compliance["contact_hours_ist"]
-            return datetime.combine(nxt, _hhmm(ch["start"]), tzinfo=IST)
+            return self.next_contact_opening(
+                datetime.combine(nxt, _hhmm(ch["start"]), tzinfo=IST)
+            )
         return local
 
     def align_to_salary_window(self, dt):
@@ -452,6 +497,10 @@ class Policy:
 
         degraded_signal = (diagnosis or {}).get("batch_signal")
         is_degraded = bool((diagnosis or {}).get("issuer_degraded"))
+        # Set only when a model classified a code the taxonomy lacks, and
+        # only after that proposal cleared the confidence floor and the
+        # closed-set check in src/llm_diagnose.
+        proposed = (diagnosis or {}).get("llm_proposed_code")
 
         # --- 1. opt-out ------------------------------------------------
         # First, and unconditional. compliance.never_do makes this the one
@@ -477,7 +526,8 @@ class Policy:
         # the only thing that can work, so this forecloses the retry rungs
         # and lets the ladder carry on to the contact rungs rather than
         # ending the transaction.
-        max_attempts, cap_rule = self.effective_max_attempts(code, is_sub)
+        max_attempts, cap_rule = self.effective_max_attempts(
+            code, is_sub, proposed=proposed)
         retry_foreclosed_by = None
         if code in self.stop_immediately_on:
             retry_foreclosed_by = "stop_immediately_on[%s]" % code
@@ -486,7 +536,7 @@ class Policy:
         elif attempt_number >= max_attempts:
             retry_foreclosed_by = cap_rule
 
-        cooldown, cooldown_rule = self.cooldown_for(code)
+        cooldown, cooldown_rule = self.cooldown_for(code, proposed=proposed)
         last_attempt = (
             _parse(state.last_attempt_at) if state.last_attempt_at else failed_at
         )
@@ -542,7 +592,7 @@ class Policy:
             # attempt against limits.max_attempts for a reason that has nothing
             # to do with this customer. Hold; the attempt keeps its value.
             if is_degraded and degraded_signal:
-                window, wpath = self._window_for(code)
+                window, wpath = self._window_for(code, proposed=proposed)
                 window_end = _parse(degraded_signal["window_end"])
                 resume_at = window_end
                 bounded = ["issuer_degradation"]
@@ -591,7 +641,7 @@ class Policy:
         return self._climb_ladder(
             transaction, diagnosis, state, now, failed_at,
             code, attempt_number, max_attempts, cap_rule, is_degraded,
-            retry_foreclosed_by, cooldown_elapsed,
+            retry_foreclosed_by, cooldown_elapsed, proposed,
         )
 
     def _predicate_rule(self, name):
@@ -634,10 +684,10 @@ class Policy:
     def _climb_ladder(self, transaction, diagnosis, state, now, failed_at,
                       code, attempt_number, max_attempts, cap_rule,
                       is_degraded, retry_foreclosed_by=None,
-                      cooldown_elapsed=True) -> Decision:
+                      cooldown_elapsed=True, proposed=None) -> Decision:
         txn_id = transaction.get("transaction_id")
         is_sub = bool(transaction.get("is_subscription"))
-        window, wpath = self._window_for(code)
+        window, wpath = self._window_for(code, proposed=proposed)
 
         spacing_hours = float(self.limits.get("min_hours_between_contacts", 0))
         if state.last_contact_at:
@@ -666,6 +716,8 @@ class Policy:
             "max_contacts_per_customer_per_24h": self.limits.get(
                 "max_contacts_per_customer_per_24h"),
             "within_contact_hours": self.within_contact_hours(now),
+            "require_consent_for_contact": self.compliance.get(
+                "require_consent_for_contact", True),
         }
 
         passed_over = []
@@ -886,7 +938,9 @@ class Policy:
             last_attempt = (
                 _parse(state.last_attempt_at) if state.last_attempt_at else failed_at
             )
-            cooldown, cooldown_rule = self.cooldown_for(code)
+            cooldown, cooldown_rule = self.cooldown_for(
+                code, proposed=diagnosis.get("llm_proposed_code")
+                if diagnosis else None)
             cooldown_end = last_attempt + cooldown
             if scheduled < cooldown_end:
                 scheduled = cooldown_end

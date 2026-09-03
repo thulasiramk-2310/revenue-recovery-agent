@@ -59,8 +59,12 @@ limits:
                                   # quota. Spacing is a compliance property of
                                   # the contact budget, not of the retry
                                   # cooldown, which protects the instrument.
-  batch_spend_ceiling_paise: 0    # 0 = agent may not incur cost. Raise
-                                  # deliberately, never by default.
+  batch_spend_ceiling_paise: 100000
+                                  # Rs 1,000 demo ceiling. The shipped run
+                                  # spends Rs 943.50, so the guard is active
+                                  # without truncating the reference batch.
+                                  # Set to 0/null to disable in experiments;
+                                  # lower it deliberately to prove the abort.
   abort_batch_if_decline_rate_above: 0.85
                                   # circuit breaker: if live retries are
                                   # declining above this rate, halt the batch.
@@ -175,6 +179,46 @@ retry_windows:
 # here rather than in code so that policy.py needs no literal failure code of
 # its own -- see the architectural rule at the top of this file.
 unmapped_code_fallback: UNKNOWN
+
+# --- LLM diagnosis of unmapped codes -------------------------------------
+# A model may PROPOSE a diagnosis for a failure code the taxonomy does not
+# know. It may never choose an action, set a delay, or touch a limit. Those
+# stay here, and policy.py stays the only thing that decides.
+#
+# The containment is structural rather than a matter of prompt discipline:
+#   - the model may only return a code that ALREADY exists in the taxonomy,
+#     so it cannot invent a severity or a retry allowance
+#   - only codes MISSING from the taxonomy are ever sent, so a proposal can
+#     never override or soften a code the project already understands
+#   - every failure -- unmapped proposal, malformed output, HTTP error,
+#     timeout, missing key -- routes to unmapped_code_fallback above
+#
+# That last one is the important one. An LLM timeout must never become
+# permission. The fallback it lands on is UNKNOWN, whose single retry at
+# +360 min was argued for on its own merits long before any model was
+# planned: "we don't know what this is" is the opposite of a reason to relax
+# a limit.
+llm_diagnosis:
+  enabled: true
+  provider: groq
+  model: llama-3.3-70b-versatile
+  prompt_version: diag-v1       # bump on ANY prompt edit. The audit trail
+                                # records this so a reviewer can tell a model
+                                # change from a prompt change later -- they
+                                # have completely different fixes.
+  min_confidence: 0.70          # below this the proposal is discarded and the
+                                # code stays UNKNOWN. A guess that clears the
+                                # bar by pretending to be certain is the one
+                                # failure this cannot detect, which is why the
+                                # prompt tells the model to answer UNSURE.
+  timeout_seconds: 8
+  max_output_tokens: 300
+  rationale: >
+    Worth doing because the taxonomy is eight hand-written codes and a real
+    merchant stream is not. Worth bounding this tightly because a wrong
+    confident mapping can authorise retries against an account that will
+    never settle, which is exactly the harm the stopping rules exist to
+    prevent.
 
 # --- Salary-credit alignment ---------------------------------------------
 # Used by retry_windows[*].align_to. A scheduled retry is nudged into the next
