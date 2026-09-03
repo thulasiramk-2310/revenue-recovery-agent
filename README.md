@@ -363,7 +363,7 @@ claim either.
 | property | across all 8 seeds |
 |---|---|
 | attempts vs baseline | **2.7× – 3.2× fewer** (mean 3.0×) |
-| ₹ recovered per attempt | **agent higher in 8 of 8** — 1.4× to 9.7×, mean 3.6× |
+| ₹ recovered per attempt | **agent higher in 8 of 8** — 1.4× to 9.6×, mean 3.6× |
 | contacts outside 09:00–21:00 IST | **0** |
 | transactions over the contact quota | **0** |
 | worst rolling-24h messages to one person | **2**, exactly the cap, every seed |
