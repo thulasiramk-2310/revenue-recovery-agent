@@ -933,6 +933,7 @@ src/audit.py           hash-chained append-only trail
 src/replay.py          rebuild a run from its log alone
 src/run_batch.py       orchestrator, cost model, comparison table
 src/sensitivity.py     result vs window width
+scripts/               reproduce the screens shown in the demo video
 baseline/fixed_retry.py  the +1h/+24h/+72h control arm
 policy.yaml            every limit, delay, terminal code and rail
 WINDOW_MODEL.md        pre-registered window widths and justification
