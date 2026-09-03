@@ -19,24 +19,17 @@
     .flow { stroke-dasharray: 7 11; animation: march 1.5s linear infinite; }
     @keyframes march { to { stroke-dashoffset: -18; } }
 
-    /* the two meters drain on different clocks -- that is the whole point */
-    .drainA { animation: drainA 5s ease-in-out infinite; }
-    @keyframes drainA {
-      0%,  8%  { width: 176px; fill: #60a5fa; }
-      45%,100% { width: 0px;   fill: #60a5fa; }
-    }
-    .drainC { animation: drainC 5s ease-in-out infinite; }
-    @keyframes drainC {
-      0%, 48% { width: 176px; fill: #34d399; }
-      92%,100%{ width: 0px;   fill: #34d399; }
-    }
-    .showA { animation: showA 5s ease-in-out infinite; }
-    @keyframes showA { 0%,40% { opacity: .25; } 50%,100% { opacity: 1; } }
+    /* NO animation on the meters or the callout, deliberately.
+       GitHub renders SVG in an img element with keyframes frozen at
+       t=0, so an animated element shows its 0% state, which silently
+       overrode the
+       static width attribute and made both meters look full, i.e. the one
+       reading the diagram exists to rule out. Meaning now lives entirely in
+       the static geometry; only the decorative dash march is animated, and
+       its frozen frame looks correct. */
 
     @media (prefers-reduced-motion: reduce) {
-      .flow, .drainA, .drainC, .showA { animation: none; }
-      .drainA, .drainC { width: 88px; }
-      .showA { opacity: 1; }
+      .flow { animation: none; }
     }
   </style>
 
@@ -67,7 +60,7 @@
   <text class="t sub" x="266" y="94">max_attempts 4 · cooldown 6h</text>
 
   <rect x="502" y="58" width="180" height="16" rx="4" fill="#161b22" stroke="#30363d"/>
-  <rect class="drainA" x="504" y="60" width="14" height="12" rx="3" fill="#60a5fa"/>
+  <rect class="meter-attempts" x="504" y="60" width="14" height="12" rx="3" fill="#60a5fa"/>
   <text class="t sub" x="694" y="71" fill="#60a5fa">attempts: SPENT</text>
 
   <!-- contacts -->
@@ -77,11 +70,11 @@
   <text class="t sub" x="266" y="188">quota 2 · 24h spacing · 09-21 IST</text>
 
   <rect x="502" y="152" width="180" height="16" rx="4" fill="#161b22" stroke="#30363d"/>
-  <rect class="drainC" x="504" y="154" width="176" height="12" rx="3" fill="#34d399"/>
+  <rect class="meter-contacts" x="504" y="154" width="176" height="12" rx="3" fill="#34d399"/>
   <text class="t sub" x="694" y="165" fill="#34d399">contacts: STILL AVAILABLE</text>
 
   <!-- the moment that matters -->
-  <g class="showA" opacity="1">
+  <g class="callout">
     <rect x="502" y="86" width="330" height="40" rx="6" fill="#1a1207" stroke="#d4a017" stroke-width="1.5"/>
     <text class="t sub" x="516" y="102" fill="#fcd34d" font-weight="600">attempts exhausted — contacts still available</text>
     <text class="t sub" x="516" y="117">a hard decline stops retrying and starts talking</text>
