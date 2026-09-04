@@ -1,5 +1,7 @@
 # Recovery window model — pre-registration
 
+Recovery windows for the Bounded Recovery Agent's synthetic batch.
+
 **Written and committed BEFORE the generator was changed or any result was
 re-measured.** The git history of this file is the evidence: if the commit that
 introduces it does not precede the commit that changes

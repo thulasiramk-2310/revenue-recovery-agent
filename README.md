@@ -1,4 +1,4 @@
-# Payment Recovery Agent
+# Bounded Recovery Agent
 
 Razorpay AI Buildathon — **Track 3, AI Revenue Recovery**
 
@@ -59,7 +59,7 @@ python -m src.generate_data          # build the 240-transaction batch
 python -m src.run_batch              # run agent + baseline, print the table
 python -m src.run_ai_demo            # show the bounded AI diagnosis path
 python -m src.replay --compare       # rebuild the run from its log alone
-python -m unittest discover -s tests # 149 tests
+python -m unittest discover -s tests # 156 tests
 ```
 
 No API keys needed for any of that — the default is a dry run that touches no
@@ -586,7 +586,7 @@ credentials — lands here. A conservative default that was argued for on its
 own merits, before the hole it now plugs existed, is a great deal harder to
 attack than one written to plug it.
 
-81 of the 149 tests target these rules and their ordering.
+81 of the 156 tests target these rules and their ordering.
 
 ---
 
@@ -937,7 +937,7 @@ scripts/               reproduce the screens shown in the demo video
 baseline/fixed_retry.py  the +1h/+24h/+72h control arm
 policy.yaml            every limit, delay, terminal code and rail
 WINDOW_MODEL.md        pre-registered window widths and justification
-tests/                 149 tests, stdlib unittest
+tests/                 156 tests, stdlib unittest
 ```
 
 Dependencies: PyYAML and python-dotenv. The gateway client is stdlib

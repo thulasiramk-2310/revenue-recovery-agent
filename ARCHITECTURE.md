@@ -1,7 +1,8 @@
 # Architecture
 
 Two pages. The README has the results and the argument; this is the shape of
-the system, where the model sits, and what happens when things break.
+the Bounded Recovery Agent, where the model sits, and what happens when
+things break.
 
 ---
 
