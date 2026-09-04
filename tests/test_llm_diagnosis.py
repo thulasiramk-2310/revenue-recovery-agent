@@ -16,6 +16,7 @@ be the one policy.yaml already defined for its own reasons.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -470,6 +471,98 @@ class TestPolicyOwnsTheConfiguration(unittest.TestCase):
                 '"%s"' % code, body,
                 "%s is hardcoded in llm_diagnose.py; it must come from the "
                 "taxonomy" % code)
+
+
+# -- the real HTTP request, not a stub -------------------------------------
+
+class TestTheOutgoingRequestIsWellFormed(unittest.TestCase):
+    """Everything else here stubs the transport. This class does not.
+
+    That distinction is the reason this class exists. The suite had 149
+    passing tests while the live path was completely dead: Groq sits behind
+    Cloudflare, which rejected urllib's default "Python-urllib/3.11"
+    signature with HTTP 403 and Cloudflare error 1010 before the API key was
+    even read. Not one test noticed, because a stubbed transport never builds
+    a real Request and therefore never has a header to get wrong.
+
+    So these tests inspect the actual urllib.request.Request object. They
+    still make no network call -- urlopen is mocked -- but everything up to
+    the socket is real.
+    """
+
+    def _capture(self, fn, *args):
+        seen = {}
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"{}"}}],"content":[{"text":"{}"}]}'
+
+        def fake_urlopen(req, timeout=None):
+            seen["req"] = req
+            seen["timeout"] = timeout
+            return Response()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            fn(*args)
+        return seen
+
+    def test_groq_request_identifies_the_client(self):
+        from src.llm_diagnose import USER_AGENT, _call_groq
+        seen = self._capture(_call_groq, "prompt", "key", "m", 8, 300)
+        ua = seen["req"].get_header("User-agent")
+        self.assertEqual(ua, USER_AGENT)
+        self.assertNotIn("Python-urllib", ua or "",
+                         "the default urllib UA is blocked by Cloudflare")
+
+    def test_anthropic_request_identifies_the_client(self):
+        from src.llm_diagnose import USER_AGENT, _call_anthropic
+        seen = self._capture(_call_anthropic, "prompt", "key", "m", 8, 300)
+        self.assertEqual(seen["req"].get_header("User-agent"), USER_AGENT)
+
+    def test_groq_request_carries_auth_and_content_type(self):
+        from src.llm_diagnose import _call_groq
+        seen = self._capture(_call_groq, "prompt", "sekrit", "m", 8, 300)
+        req = seen["req"]
+        self.assertEqual(req.get_header("Authorization"), "Bearer sekrit")
+        self.assertEqual(req.get_header("Content-type"), "application/json")
+        self.assertEqual(req.get_method(), "POST")
+
+    def test_the_configured_timeout_reaches_the_socket(self):
+        # A timeout that is set in policy.yaml but never passed to urlopen is
+        # the same class of bug as a header that is never set: invisible to
+        # every stubbed test, and fatal in production.
+        from src.llm_diagnose import _call_groq
+        seen = self._capture(_call_groq, "prompt", "key", "m", 3.5, 300)
+        self.assertEqual(seen["timeout"], 3.5)
+
+    def test_the_api_key_is_never_placed_in_the_url(self):
+        from src.llm_diagnose import _call_groq
+        seen = self._capture(_call_groq, "prompt", "sekrit", "m", 8, 300)
+        self.assertNotIn("sekrit", seen["req"].full_url)
+
+    def test_the_configured_model_is_the_one_sent(self):
+        from src.llm_diagnose import _call_groq
+        seen = self._capture(_call_groq, "prompt", "key", "some-model", 8, 300)
+        body = json.loads(seen["req"].data.decode("utf-8"))
+        self.assertEqual(body["model"], "some-model")
+
+    def test_the_configured_model_exists_in_the_policy_document(self):
+        # Guards the other half of the live failure: the model id in
+        # policy.yaml was one this account cannot reach, which returned 404.
+        # A name is not checkable offline, but its shape is -- an empty or
+        # placeholder id should not reach a live run.
+        policy = load_policy(POLICY_PATH)
+        model = policy.doc["llm_diagnosis"]["model"]
+        self.assertTrue(model and not model.startswith("<"), model)
+        self.assertNotIn("xxx", model.lower(), model)
 
 
 if __name__ == "__main__":

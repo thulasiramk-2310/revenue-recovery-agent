@@ -64,6 +64,14 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+# Sent on every request. Not cosmetic: Groq sits behind Cloudflare, which
+# rejects urllib's default "Python-urllib/3.11" signature with HTTP 403 and
+# Cloudflare error 1010 -- before the API key is even looked at. The whole
+# live path was dead because of a missing header, and the test suite could
+# not see it because every test stubs the transport. Identifying the client
+# properly is good manners anyway.
+USER_AGENT = "revenue-recovery-agent/1.0 (+https://github.com/thulasiramk-2310/revenue-recovery-agent)"
+
 # Verdicts. Every call produces exactly one of these in the trail.
 ACCEPTED = "accepted"
 REJECTED_UNKNOWN_CODE = "rejected_code_not_in_taxonomy"
@@ -226,6 +234,7 @@ def _call_anthropic(prompt, api_key, model, timeout, max_tokens):
     req.add_header("content-type", "application/json")
     req.add_header("anthropic-version", ANTHROPIC_API_VERSION)
     req.add_header("x-api-key", api_key)
+    req.add_header("user-agent", USER_AGENT)
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -266,6 +275,7 @@ def _call_groq(prompt, api_key, model, timeout, max_tokens):
     req = urllib.request.Request(GROQ_API_URL, data=body, method="POST")
     req.add_header("content-type", "application/json")
     req.add_header("authorization", "Bearer " + api_key)
+    req.add_header("user-agent", USER_AGENT)
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
