@@ -214,7 +214,7 @@ unmapped_code_fallback: UNKNOWN
 llm_diagnosis:
   enabled: true
   provider: groq
-  model: llama-3.3-70b-versatile
+  model: openai/gpt-oss-120b
   prompt_version: diag-v1       # bump on ANY prompt edit. The audit trail
                                 # records this so a reviewer can tell a model
                                 # change from a prompt change later -- they
